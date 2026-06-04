@@ -24,7 +24,7 @@ import numpy as np
 
 @dataclass
 class Config:
-    n_det: int = 1
+    n_det: int = 18
     n_star: int = 5000
     n_exp: int = 40
     nx: int = 4096
@@ -121,7 +121,10 @@ def simulate_data(config):
     true_star_mag = rng.uniform(18.0, 23.0, size=config.n_star)
     star_base_x = rng.uniform(0.0, config.nx, size=config.n_star)
     star_base_y = rng.uniform(0.0, config.ny, size=config.n_star)
-    star_detector_id = rng.integers(0, config.n_det, size=config.n_star)
+    detector_ids = np.arange(1, config.n_det + 1, dtype=int)
+    star_detector_index = np.arange(config.n_star, dtype=int) % config.n_det
+    rng.shuffle(star_detector_index)
+    star_detector_id = detector_ids[star_detector_index]
 
     dither_dx = rng.normal(0.0, config.dither_sigma_pix, size=config.n_exp)
     dither_dy = rng.normal(0.0, config.dither_sigma_pix, size=config.n_exp)
@@ -163,11 +166,12 @@ def simulate_data(config):
         sid = np.nonzero(in_bounds)[0]
         x_obs = x[in_bounds]
         y_obs = y[in_bounds]
+        det_index_obs = star_detector_index[in_bounds]
         det_obs = star_detector_id[in_bounds]
         amp_obs = amp_id_from_x(x_obs, nx=config.nx, n_amp=config.n_amp)
         xn, yn = normalized_xy(x_obs, y_obs, config)
         smooth = poly_basis(xn, yn) @ true_smooth_coeffs
-        amp = true_amp_offsets[det_obs, amp_obs]
+        amp = true_amp_offsets[det_index_obs, amp_obs]
         noise = rng.normal(0.0, config.phot_sigma_mag, size=sid.size)
         m_obs = true_star_mag[sid] + true_zp[exp_id] + smooth + amp + noise
 
@@ -267,6 +271,7 @@ def save_simulated_data(data, config):
 
     metadata = asdict(config)
     metadata["n_obs"] = int(data.m_obs.size)
+    metadata["detector_ids"] = list(range(1, config.n_det + 1))
     metadata["rotation_angles_deg"] = list(config.rotation_angles_deg)
     metadata["true_smooth_coeffs"] = list(config.true_smooth_coeffs)
     with open(output_dir / config.metadata_file, "w", encoding="utf-8") as handle:

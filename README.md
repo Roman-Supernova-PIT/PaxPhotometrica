@@ -57,15 +57,16 @@ instrumental_mag
 instrumental_mag_uncertainty
 ```
 
-`star_id` is stable across exposures. The fitter maps the unique IDs in the
-table onto compact sparse-matrix parameter columns.
+`star_id` is stable across exposures. `detector_id` uses NASA-style one-based
+numbering, so the default detector IDs are `1..18`. The fitter maps the unique
+star and detector IDs in the table onto compact sparse-matrix parameter columns.
 
 ## Geometry
 
 The default detector geometry is
 
 ```text
-N_DET = 1
+N_DET = 18
 NX = 4096
 NY = 4096
 N_AMP = 32
@@ -79,6 +80,10 @@ amp_id = floor(x_pixel / AMP_WIDTH)
 ```
 
 with clipping to `[0, 31]`.
+
+The default `5,000` stars are distributed approximately evenly across the 18
+detectors, and each detector has its own independent set of 32 amplifier
+offsets. The simulated observation table numbers those detectors `1..18`.
 
 ## Degeneracies
 
@@ -98,13 +103,12 @@ the fitter does not use explicit priors on the smooth `x` or `y` coefficients.
 
 ## Default Verification
 
-A default run currently produces about `155,764` observations and `5,076` fitted
+A default run currently produces about `164,593` observations and `5,620` fitted
 parameters. Typical diagnostics are:
 
 ```text
-RMS residual: 0.004906 mag
-Exposure ZP RMS error: 0.000099 mag
-Smooth field RMS error, mean removed: 0.000318 mag
-Amplifier offset RMS error, per-detector means removed: 0.000466 mag
+RMS residual: 0.004899 mag
+Exposure ZP RMS error: 0.000139 mag
+Smooth field RMS error, mean removed: 0.000398 mag
+Amplifier offset RMS error, per-detector means removed: 0.000432 mag
 ```
-

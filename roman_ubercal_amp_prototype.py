@@ -56,6 +56,8 @@ class ObservationData:
     unique_star_ids: np.ndarray
     exposure_id: np.ndarray
     detector_id: np.ndarray
+    detector_param_id: np.ndarray
+    unique_detector_ids: np.ndarray
     amp_id: np.ndarray
     x: np.ndarray
     y: np.ndarray
@@ -155,6 +157,7 @@ def load_simulated_data(config):
     unique_star_ids, star_param_id = np.unique(star_id, return_inverse=True)
     exposure_id = table["exposure_id"].astype(int)
     detector_id = table["detector_id"].astype(int)
+    unique_detector_ids, detector_param_id = np.unique(detector_id, return_inverse=True)
     amp_id = table["amp_id"].astype(int)
     x = table["x_pixel"].astype(float)
     y = table["y_pixel"].astype(float)
@@ -162,7 +165,7 @@ def load_simulated_data(config):
     sigma = table["instrumental_mag_uncertainty"].astype(float)
 
     config.n_exp = max(config.n_exp, int(exposure_id.max()) + 1)
-    config.n_det = max(config.n_det, int(detector_id.max()) + 1)
+    config.n_det = unique_detector_ids.size
 
     truth = _load_truth(config)
     true_star_mag = None
@@ -191,6 +194,8 @@ def load_simulated_data(config):
         unique_star_ids=unique_star_ids,
         exposure_id=exposure_id,
         detector_id=detector_id,
+        detector_param_id=detector_param_id,
+        unique_detector_ids=unique_detector_ids,
         amp_id=amp_id,
         x=x,
         y=y,
@@ -242,7 +247,7 @@ def build_design_matrix(data, config):
             cols.append(data.idx_smooth + p)
             vals.append(basis[k, p] * weight)
 
-        amp_col = data.idx_amp + data.detector_id[k] * config.n_amp + data.amp_id[k]
+        amp_col = data.idx_amp + data.detector_param_id[k] * config.n_amp + data.amp_id[k]
         rows.append(row)
         cols.append(amp_col)
         vals.append(weight)
@@ -298,7 +303,7 @@ def unpack_solution(theta, data, config):
         star_mag[data.star_param_id]
         + zp[data.exposure_id]
         + smooth
-        + amp_offsets[data.detector_id, data.amp_id]
+        + amp_offsets[data.detector_param_id, data.amp_id]
     )
     residual = data.m_obs - model_m_obs
 
@@ -346,7 +351,7 @@ def make_diagnostics(data, solution, config):
     rms_resid = np.sqrt(np.mean(solution.residual**2))
     med_abs_resid = np.median(np.abs(solution.residual))
     amp_counts = np.bincount(
-        data.detector_id * config.n_amp + data.amp_id,
+        data.detector_param_id * config.n_amp + data.amp_id,
         minlength=config.n_det * config.n_amp,
     ).reshape(config.n_det, config.n_amp)
 
@@ -381,11 +386,15 @@ def make_diagnostics(data, solution, config):
     print("Number of observations per amplifier:")
     for det_id in range(config.n_det):
         counts = " ".join(f"{count:6d}" for count in amp_counts[det_id])
-        print(f"  det {det_id:02d}: {counts}")
+        print(f"  det {data.unique_detector_ids[det_id]:02d}: {counts}")
 
 
 def _detectors_to_plot(config):
     return range(config.n_det)
+
+
+def _detector_label(data, det_index):
+    return f"det {data.unique_detector_ids[det_index]}"
 
 
 def make_plots(data, solution, config):
@@ -399,7 +408,12 @@ def make_plots(data, solution, config):
     if data.true_amp_offsets is not None:
         plt.figure(figsize=(10, 5))
         for det_id in dets:
-            plt.plot(amps, data.true_amp_offsets[det_id], marker="o", label=f"det {det_id}")
+            plt.plot(
+                amps,
+                data.true_amp_offsets[det_id],
+                marker="o",
+                label=_detector_label(data, det_id),
+            )
         plt.axhline(0.0, color="0.3", linewidth=1)
         plt.xlabel("Amplifier ID")
         plt.ylabel("True amp offset [mag]")
@@ -412,7 +426,12 @@ def make_plots(data, solution, config):
 
     plt.figure(figsize=(10, 5))
     for det_id in dets:
-        plt.plot(amps, solution.amp_offsets[det_id], marker="o", label=f"det {det_id}")
+        plt.plot(
+            amps,
+            solution.amp_offsets[det_id],
+            marker="o",
+            label=_detector_label(data, det_id),
+        )
     plt.axhline(0.0, color="0.3", linewidth=1)
     plt.xlabel("Amplifier ID")
     plt.ylabel("Recovered amp offset [mag]")
@@ -502,13 +521,13 @@ def make_plots(data, solution, config):
     amp_median = np.full((config.n_det, config.n_amp), np.nan)
     for det_id in range(config.n_det):
         for amp_id in range(config.n_amp):
-            mask = (data.detector_id == det_id) & (data.amp_id == amp_id)
+            mask = (data.detector_param_id == det_id) & (data.amp_id == amp_id)
             if np.any(mask):
                 amp_median[det_id, amp_id] = np.median(solution.residual[mask])
 
     plt.figure(figsize=(10, 5))
     for det_id in dets:
-        plt.plot(amps, amp_median[det_id], marker="o", label=f"det {det_id}")
+        plt.plot(amps, amp_median[det_id], marker="o", label=_detector_label(data, det_id))
     plt.axhline(0.0, color="0.2", linewidth=1)
     plt.xlabel("Amplifier ID")
     plt.ylabel("Median residual [mag]")
