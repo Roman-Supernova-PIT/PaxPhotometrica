@@ -93,7 +93,8 @@ freedoms by:
 - fixing exposure 0 to `ZP = 0` by omitting its parameter,
 - omitting the constant term from the smooth polynomial,
 - constraining the mean amplifier offset per detector to zero,
-- adding weak Gaussian priors on individual amplifier offsets.
+- adding weak Gaussian priors on individual amplifier offsets, with default
+  width `sigma_amp_prior = 0.02 mag`.
 
 Pure translation dithers leave detector-plane linear smooth gradients degenerate
 with fitted star magnitudes and exposure zeropoints. The generator therefore
