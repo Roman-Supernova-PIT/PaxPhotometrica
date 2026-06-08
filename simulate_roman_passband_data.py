@@ -38,15 +38,19 @@ class SimConfig:
     n_det: int = 1
     nx: int = 4096
     ny: int = 4096
-    n_filter: int = 4
+    n_filter: int = 6
     wave_min: float = 0.45
     wave_max: float = 2.30
     n_wave: int = 2000
+    passband_file: str = "passbands.txt"
     phot_sigma_mag: float = 0.005
     output_dir: str = "passband_sim_outputs"
     detection_fraction: float = 0.92
-    shift_sigma_um: float = 0.005
+    shift_sigma_um: float = 0.001
     width_sigma: float = 0.01
+    mode_smooth_sigma_pix: float = 4.0
+    max_abs_phi_shift: float = 250.0
+    max_abs_phi_width: float = 80.0
 
 
 def trapz_integral(y: np.ndarray, wave: np.ndarray, axis: int = -1) -> np.ndarray:
@@ -60,41 +64,60 @@ def make_wavelength_grid(config: SimConfig) -> np.ndarray:
     return np.linspace(config.wave_min, config.wave_max, config.n_wave)
 
 
-def logistic_tophat(wave: np.ndarray, left: float, right: float, edge: float) -> np.ndarray:
-    """Smooth top-hat with logistic edges."""
-    blue_edge = 1.0 / (1.0 + np.exp(-(wave - left) / edge))
-    red_edge = 1.0 / (1.0 + np.exp((wave - right) / edge))
-    return blue_edge * red_edge
+def read_nominal_passbands(
+    config: SimConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
+    """Read Roman nominal passbands from a whitespace-delimited text file.
+
+    The file is expected to have a wavelength column in microns followed by one
+    throughput column per filter, for example: Wave F062 F087 ... F184. The
+    throughputs only need to be relative; broadband magnitudes absorb the
+    arbitrary normalization into each star's fitted magnitude normalization.
+    """
+    path = Path(config.passband_file)
+    if not path.exists():
+        raise FileNotFoundError(f"Missing passband file: {path}")
+
+    table = pd.read_csv(path, sep=r"\s+", engine="python")
+    if "Wave" in table.columns:
+        wave_col = "Wave"
+    else:
+        wave_col = table.columns[0]
+
+    wave = table[wave_col].to_numpy(float)
+    filter_names = [col.strip() for col in table.columns if col != wave_col]
+    passbands = table[filter_names].to_numpy(float).T
+    passbands = np.clip(passbands, 0.0, None)
+
+    if passbands.shape[0] != config.n_filter:
+        raise ValueError(
+            f"Config n_filter={config.n_filter}, but {path} has "
+            f"{passbands.shape[0]} filter columns"
+        )
+    if np.any(np.diff(wave) <= 0.0):
+        raise ValueError(f"Wavelength grid in {path} must be strictly increasing")
+
+    denom = trapz_integral(passbands, wave, axis=1)
+    if np.any(denom <= 0.0):
+        raise ValueError("Every passband must have positive integrated throughput")
+    centers = trapz_integral(passbands * wave[None, :], wave, axis=1) / denom
+    return wave, passbands, centers, filter_names
 
 
-def make_nominal_passbands(config: SimConfig, wave: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Create four broad toy passbands from roughly 0.6 to 2.0 microns."""
-    edges = np.array(
-        [
-            [0.58, 0.88],
-            [0.86, 1.22],
-            [1.18, 1.58],
-            [1.54, 2.05],
-        ]
-    )
-    if config.n_filter != 4:
-        raise ValueError("This v1 toy simulator expects n_filter = 4")
-
-    passbands = []
-    centers = []
-    for left, right in edges:
-        t = logistic_tophat(wave, left, right, edge=0.025)
-        # Add a small smooth ripple so the derivative modes are not perfectly
-        # symmetric, while keeping throughput positive and broad.
-        center = 0.5 * (left + right)
-        ripple = 1.0 + 0.025 * np.cos(2.0 * np.pi * (wave - center) / (right - left))
-        passbands.append(np.clip(t * ripple, 0.0, None))
-        centers.append(center)
-    return np.asarray(passbands), np.asarray(centers)
+def gaussian_smooth_1d(values: np.ndarray, sigma_pix: float) -> np.ndarray:
+    """Small dependency-free Gaussian smoothing for tabulated passband modes."""
+    if sigma_pix <= 0.0:
+        return values.copy()
+    radius = max(1, int(np.ceil(4.0 * sigma_pix)))
+    x = np.arange(-radius, radius + 1, dtype=float)
+    kernel = np.exp(-0.5 * (x / sigma_pix) ** 2)
+    kernel /= kernel.sum()
+    padded = np.pad(values, radius, mode="edge")
+    return np.convolve(padded, kernel, mode="valid")
 
 
 def make_passband_modes(
-    wave: np.ndarray, passbands: np.ndarray, centers: np.ndarray
+    wave: np.ndarray, passbands: np.ndarray, centers: np.ndarray, config: SimConfig
 ) -> tuple[np.ndarray, np.ndarray]:
     """Derivative-based log-throughput modes for shift and width changes."""
     phi_shift = np.zeros_like(passbands)
@@ -103,9 +126,20 @@ def make_passband_modes(
     for filt in range(passbands.shape[0]):
         t0 = passbands[filt]
         t_floor = np.maximum(t0, 1e-6 * np.max(t0))
-        dlogt_dwave = np.gradient(np.log(t_floor), wave)
-        phi_shift[filt] = -dlogt_dwave
-        phi_width[filt] = -(wave - centers[filt]) * dlogt_dwave
+        # The delivered passbands are finely sampled and can have very sharp
+        # numerical edges. Smoothing the floored log-throughput before taking a
+        # derivative keeps the toy perturbation modes in the small-signal regime
+        # appropriate for the linearized fitter.
+        logt_smooth = gaussian_smooth_1d(np.log(t_floor), config.mode_smooth_sigma_pix)
+        dlogt_dwave = np.gradient(logt_smooth, wave)
+        phi_shift[filt] = np.clip(
+            -dlogt_dwave, -config.max_abs_phi_shift, config.max_abs_phi_shift
+        )
+        phi_width[filt] = np.clip(
+            -(wave - centers[filt]) * dlogt_dwave,
+            -config.max_abs_phi_width,
+            config.max_abs_phi_width,
+        )
 
     return phi_shift, phi_width
 
@@ -166,6 +200,7 @@ def write_passband_files(
     phi_shift: np.ndarray,
     phi_width: np.ndarray,
     ice_basis: np.ndarray,
+    filter_names: list[str],
 ) -> None:
     passband_rows = []
     mode_rows = []
@@ -175,6 +210,7 @@ def write_passband_files(
                 {
                     "wavelength_um": wave,
                     "filter_id": filt,
+                    "filter_name": filter_names[filt],
                     "throughput": passbands[filt],
                 }
             )
@@ -184,6 +220,7 @@ def write_passband_files(
                 {
                     "wavelength_um": wave,
                     "filter_id": filt,
+                    "filter_name": filter_names[filt],
                     "phi_shift": phi_shift[filt],
                     "phi_width": phi_width[filt],
                 }
@@ -213,14 +250,15 @@ def simulate_data(config: SimConfig) -> None:
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    wave = make_wavelength_grid(config)
-    passbands, filter_centers = make_nominal_passbands(config, wave)
-    phi_shift, phi_width = make_passband_modes(wave, passbands, filter_centers)
+    wave, passbands, filter_centers, filter_names = read_nominal_passbands(config)
+    phi_shift, phi_width = make_passband_modes(wave, passbands, filter_centers, config)
     ice_basis, _ = make_ice_basis(wave)
     true_ice_coeff = np.array([0.010, 0.018, 0.026])
     tau_ice_true = true_ice_coeff @ ice_basis
 
-    write_passband_files(output_dir, wave, passbands, phi_shift, phi_width, ice_basis)
+    write_passband_files(
+        output_dir, wave, passbands, phi_shift, phi_width, ice_basis, filter_names
+    )
 
     detector_ids = np.arange(1, config.n_det + 1, dtype=int)
     star_detector_index = np.arange(config.n_star, dtype=int) % config.n_det
@@ -257,6 +295,7 @@ def simulate_data(config: SimConfig) -> None:
             pass_rows.append(
                 {
                     "filter_id": filt,
+                    "filter_name": filter_names[filt],
                     "detector_id": det_id,
                     "delta_lambda_um": true_shift[filt, det_index],
                     "width": true_width[filt, det_index],
@@ -319,6 +358,7 @@ def simulate_data(config: SimConfig) -> None:
                     "exposure_id": exp_id,
                     "epoch_id": epoch_id[exp_id],
                     "filter_id": filt,
+                    "filter_name": filter_names[filt],
                     "detector_id": det_id,
                     "x": x,
                     "y": y,
@@ -336,27 +376,35 @@ def simulate_data(config: SimConfig) -> None:
     pd.DataFrame(rows).to_csv(output_dir / "measurements.csv", index=False)
 
     metadata = asdict(config)
+    metadata["wave_min"] = float(wave.min())
+    metadata["wave_max"] = float(wave.max())
+    metadata["n_wave"] = int(wave.size)
     metadata["detector_ids"] = detector_ids.tolist()
+    metadata["filter_names"] = filter_names
     metadata["filter_centers_um"] = filter_centers.tolist()
     metadata["n_obs"] = len(rows)
     with open(output_dir / "simulation_metadata.json", "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2, sort_keys=True)
 
-    make_diagnostic_plots(output_dir, wave, passbands, tau_ice_true)
+    make_diagnostic_plots(output_dir, wave, passbands, tau_ice_true, filter_names)
 
     print(f"Saved {len(rows)} observations to {output_dir / 'measurements.csv'}")
     print(f"Saved simulator products to {output_dir.resolve()}")
 
 
 def make_diagnostic_plots(
-    output_dir: Path, wave: np.ndarray, passbands: np.ndarray, tau_ice_true: np.ndarray
+    output_dir: Path,
+    wave: np.ndarray,
+    passbands: np.ndarray,
+    tau_ice_true: np.ndarray,
+    filter_names: list[str],
 ) -> None:
     plt.figure(figsize=(8, 4.5))
     for filt in range(passbands.shape[0]):
-        plt.plot(wave, passbands[filt], label=f"filter {filt}")
+        plt.plot(wave, passbands[filt], label=filter_names[filt])
     plt.xlabel("Wavelength [um]")
     plt.ylabel("Nominal throughput")
-    plt.title("Toy nominal passbands")
+    plt.title("Nominal passbands")
     plt.legend()
     plt.tight_layout()
     plt.savefig(output_dir / "sim_nominal_passbands.png", dpi=160)
@@ -366,7 +414,7 @@ def make_diagnostic_plots(
     plt.plot(wave, tau_ice_true, color="tab:blue")
     plt.xlabel("Wavelength [um]")
     plt.ylabel("Optical depth per ice amount")
-    plt.title("True toy ice optical-depth shape")
+    plt.title("True ice optical-depth shape")
     plt.tight_layout()
     plt.savefig(output_dir / "sim_true_ice_tau.png", dpi=160)
     plt.close()

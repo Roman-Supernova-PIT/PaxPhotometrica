@@ -65,6 +65,7 @@ class DataBundle:
     measurements: pd.DataFrame
     wave: np.ndarray
     filter_ids: np.ndarray
+    filter_names: list[str]
     detector_ids: np.ndarray
     star_ids: np.ndarray
     filter_param_id: np.ndarray
@@ -187,6 +188,18 @@ def load_data(config: FitConfig) -> DataBundle:
     pass_lookup = {value: i for i, value in enumerate(all_pass_filter_ids)}
     pass_indices = np.array([pass_lookup[value] for value in filter_ids], dtype=int)
 
+    passband_table = pd.read_csv(input_dir / "nominal_passbands.csv")
+    if "filter_name" in passband_table.columns:
+        filter_name_lookup = (
+            passband_table[["filter_id", "filter_name"]]
+            .drop_duplicates()
+            .set_index("filter_id")["filter_name"]
+            .to_dict()
+        )
+        filter_names = [str(filter_name_lookup.get(value, f"filter {value}")) for value in filter_ids]
+    else:
+        filter_names = [f"filter {value}" for value in filter_ids]
+
     passbands = pass_data["throughput"][pass_indices]
     phi_shift = mode_data["phi_shift"][pass_indices]
     phi_width = mode_data["phi_width"][pass_indices]
@@ -209,6 +222,7 @@ def load_data(config: FitConfig) -> DataBundle:
         measurements=measurements,
         wave=wave,
         filter_ids=filter_ids,
+        filter_names=filter_names,
         detector_ids=detector_ids,
         star_ids=star_ids,
         filter_param_id=filter_param_id,
@@ -595,6 +609,7 @@ def save_outputs(
             pass_rows.append(
                 {
                     "filter_id": filt,
+                    "filter_name": data.filter_names[filt_i],
                     "detector_id": det,
                     "delta_lambda_um": state.shift[filt_i, det_i],
                     "width": state.width[filt_i, det_i],
@@ -642,7 +657,8 @@ def print_diagnostics(
     residual_frame["residual"] = final_resid
     print("RMS residual by filter:")
     for filt, sub in residual_frame.groupby("filter_id"):
-        print(f"  filter {int(filt)}: {rms(sub['residual'].to_numpy()):.6f} mag")
+        filt_index = int(np.nonzero(data.filter_ids == filt)[0][0])
+        print(f"  {data.filter_names[filt_index]}: {rms(sub['residual'].to_numpy()):.6f} mag")
     print("RMS residual by detector:")
     for det, sub in residual_frame.groupby("detector_id"):
         print(f"  detector {int(det):02d}: {rms(sub['residual'].to_numpy()):.6f} mag")

@@ -164,8 +164,10 @@ linear flux integrals over wavelength.
 
 ### Files
 
-- `simulate_roman_passband_data.py`: generates toy broad-filter photometry,
-  nominal passbands, passband modes, ice basis functions, and truth files.
+- `passbands.txt`: supplied Roman nominal relative throughputs for six filters:
+  `F062`, `F087`, `F106`, `F129`, `F158`, and `F184`.
+- `simulate_roman_passband_data.py`: generates six-filter photometry using
+  `passbands.txt`, passband modes, ice basis functions, and truth files.
 - `fit_roman_passband_model.py`: reads the simulator products and runs an
   iterative sparse linearized fit.
 - `passband_sim_outputs/measurements.csv`: simulated flattened stellar
@@ -197,9 +199,9 @@ Useful fitter options:
 /opt/anaconda3/bin/python fit_roman_passband_model.py --input-dir passband_sim_outputs --output-dir passband_fit_outputs
 ```
 
-The default simulator uses one detector, four broad toy filters, `2,000` stars,
-and `30` exposures. The scripts are structured so the detector axis can be
-expanded later.
+The default simulator uses one detector, six supplied Roman passbands, `2,000`
+stars, and `30` exposures. The scripts are structured so the detector axis can
+be expanded later.
 
 ### Measurement Table
 
@@ -260,25 +262,31 @@ These priors stabilize the linearized fit but do not remove all degeneracy. The
 diagnostics intentionally show imperfect passband and stellar-parameter
 recovery.
 
+The simulator derives `phi_shift` and `phi_width` from derivatives of the
+tabulated log-throughput curves. Since the supplied passbands have sharp
+sampled edges, the log-throughput derivatives are smoothed over a few wavelength
+samples and clipped before simulation. This keeps the injected perturbations in
+the small-signal regime needed by the linearized fitter.
+
 ### Default Verification
 
-A default run currently produces `55,074` observations and solves `6,011`
+A default run currently produces `55,071` observations and solves `6,015`
 linearized update parameters per iteration. The verified iteration summary is:
 
 ```text
 iteration  RMS residual [mag]
-0          0.013764
-1          0.008285
-2          0.006217
-3          0.005422
-4          0.005161
-5          0.005089
+0          0.010576
+1          0.010146
+2          0.006827
+3          0.005462
+4          0.005064
+5          0.004967
 ```
 
 Final default diagnostics:
 
 ```text
-Passband shift RMS error: 0.006328 um
-Passband width RMS error: 0.027010
-Ice optical-depth shape RMS error: 0.000609
+Passband shift RMS error: 0.002498 um
+Passband width RMS error: 0.010528
+Ice optical-depth shape RMS error: 0.000368
 ```
