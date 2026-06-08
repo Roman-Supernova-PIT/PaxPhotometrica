@@ -40,6 +40,22 @@ m_obs = M_star[star_id]
 where `S_smooth` is a low-order detector-coordinate polynomial with basis
 `x, y, x^2, x*y, y^2`, and each amplifier is modeled as a vertical stripe.
 
+Notation:
+
+- `m_obs`: observed instrumental magnitude for one stellar measurement.
+- `star_id`: stable simulated star identifier.
+- `M_star[star_id]`: fitted relative magnitude of that star.
+- `exposure_id`: exposure identifier.
+- `ZP[exposure_id]`: fitted scalar zeropoint for that exposure; exposure 0 is
+  fixed to zero as the reference.
+- `x`, `y`: detector pixel coordinates.
+- `S_smooth(x, y)`: fitted smooth detector-coordinate star-flat term.
+- `detector_id`: one-based detector identifier in the saved table.
+- `amp_id`: zero-based amplifier stripe identifier within a detector.
+- `A_amp[detector_id, amp_id]`: fitted additive magnitude offset for that
+  detector/amplifier pair.
+- `noise`: Gaussian photometric noise in magnitudes.
+
 ### Files
 
 - `roman_ubercal_amp_generate_data.py`: generates simulated repeated stellar
@@ -81,6 +97,17 @@ instrumental_mag_uncertainty
 `star_id` is stable across exposures. `detector_id` uses NASA-style one-based
 numbering, so the default detector IDs are `1..18`. The fitter maps the unique
 star and detector IDs in the table onto compact sparse-matrix parameter columns.
+
+Column meanings:
+
+- `obs_id`: unique row identifier for one measured star in one exposure.
+- `star_id`: stable identifier for the same simulated star across exposures.
+- `exposure_id`: exposure index; exposure 0 is the fitted zeropoint reference.
+- `detector_id`: one-based detector identifier, `1..18` by default.
+- `amp_id`: zero-based amplifier stripe identifier, `0..31`.
+- `x_pixel`, `y_pixel`: detector pixel coordinates of the observation.
+- `instrumental_mag`: simulated observed instrumental magnitude.
+- `instrumental_mag_uncertainty`: 1-sigma uncertainty in magnitudes.
 
 ### Geometry
 
@@ -162,6 +189,30 @@ This lets small multiplicative passband/ice changes enter linearly, while the
 actual synthetic observations and all response coefficients still come from
 linear flux integrals over wavelength.
 
+Notation:
+
+- `lambda`: wavelength in microns.
+- `s`: star index.
+- `b`: filter/passband index. The default filters are `F062`, `F087`, `F106`,
+  `F129`, `F158`, and `F184`.
+- `d`: detector index. In the CSV files, detector IDs are one-based; the fitter
+  maps them to zero-based internal array indices.
+- `x`, `y`: detector pixel coordinates. They are included for future spatial
+  models; v1 passband shift/width terms are detector-level constants.
+- `e`: epoch/exposure index used for time-dependent ice state.
+- `f_s(lambda)`: spectral energy distribution of star `s`.
+- `T_b(lambda, d, x, y, e)`: total throughput for filter `b` for that
+  detector, position, and epoch.
+- `T0_b(lambda)`: nominal throughput curve read from `passbands.txt`.
+- `delta_lambda_b,d`: fitted wavelength-shift coefficient for filter `b` and
+  detector `d`, in microns.
+- `width_b,d`: fitted dimensionless width/stretch coefficient for filter `b`
+  and detector `d`.
+- `phi_shift_b(lambda)`, `phi_width_b(lambda)`: derivative-based
+  log-throughput response modes derived from `T0_b(lambda)`.
+- `ice_amount_obs`: known scalar ice amount for a specific observation.
+- `tau_ice(lambda)`: fitted ice optical-depth spectral shape.
+
 ### Files
 
 - `passbands.txt`: supplied Roman nominal relative throughputs for six filters:
@@ -213,6 +264,7 @@ star_id
 exposure_id
 epoch_id
 filter_id
+filter_name
 detector_id
 x
 y
@@ -228,6 +280,31 @@ true_ice_delta_mag
 `ice_amount_obs` is treated as known input to the fitter. The fitter recovers
 the spectral shape coefficients of `tau_ice(lambda)`, not a separate ice amount
 per observation.
+
+Column meanings:
+
+- `obs_id`: unique row identifier for one measured star in one exposure.
+- `star_id`: stable identifier for the same simulated star across exposures.
+- `exposure_id`: exposure index. In the default simulation, one exposure uses
+  one filter and contains many stellar observations.
+- `epoch_id`: time/epoch index used for ice evolution. In v1 this is identical
+  to `exposure_id`, but it is kept separate so future simulations can group
+  multiple exposures into one epoch.
+- `filter_id`: compact numeric filter identifier, `0..5` by default.
+- `filter_name`: Roman filter name corresponding to `filter_id`, e.g. `F062`.
+- `detector_id`: one-based detector identifier. The default passband simulation
+  uses detector `1`.
+- `x`, `y`: detector pixel coordinates for this observation.
+- `ice_amount_obs`: known relative ice amount for this observation, including
+  exposure/epoch variation and a small position dependence.
+- `mag_obs`: noisy simulated observed magnitude.
+- `mag_unc`: 1-sigma magnitude uncertainty used for row weighting.
+- `mag_true_no_noise`: noiseless simulated magnitude including SED, passband,
+  and ice effects.
+- `true_sed_mag_nominal`: noiseless magnitude through the nominal passband only.
+- `true_passband_delta_mag`: magnitude difference from detector passband shift
+  and width perturbations, before ice is applied.
+- `true_ice_delta_mag`: magnitude difference caused by ice throughput loss.
 
 ### Fitting Method
 
