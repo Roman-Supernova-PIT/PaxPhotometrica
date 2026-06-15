@@ -8,7 +8,7 @@ Telescope WFI-style calibration experiments.
   per-amplifier offsets.
 - The second prototype fits chromatic calibration terms after scalar
   instrumental calibration: stellar SED parameters, detector-level passband
-  shifts/width changes, and an ice optical-depth spectral shape.
+  shifts/width changes, and a 2D ice log-throughput surface.
 
 Both prototypes use deterministic simulations, sparse linear algebra, and CSV
 artifacts intended to be easy to inspect.
@@ -174,15 +174,14 @@ The broadband flux model is evaluated with linear flux integrals:
 F_pred = integral f_s(lambda) * T_b(lambda, d, x, y, e) d_lambda
 ```
 
-Throughput perturbations are modeled additively in log-throughput /
-optical-depth space:
+Throughput perturbations are modeled additively in log-throughput space:
 
 ```text
 ln T_b(lambda, d, x, y, e)
   = ln T0_b(lambda)
     + delta_lambda_b,d * phi_shift_b(lambda)
     + width_b,d        * phi_width_b(lambda)
-    - ice_amount_obs   * tau_ice(lambda)
+    + I(log10(lambda), h_obs)
 ```
 
 This lets small multiplicative passband/ice changes enter linearly, while the
@@ -200,6 +199,7 @@ Notation:
 - `x`, `y`: detector pixel coordinates. They are included for future spatial
   models; v1 passband shift/width terms are detector-level constants.
 - `e`: epoch/exposure index used for time-dependent ice state.
+- `h_obs`: known ice-thickness coordinate for a specific observation.
 - `f_s(lambda)`: spectral energy distribution of star `s`.
 - `T_b(lambda, d, x, y, e)`: total throughput for filter `b` for that
   detector, position, and epoch.
@@ -210,15 +210,17 @@ Notation:
   and detector `d`.
 - `phi_shift_b(lambda)`, `phi_width_b(lambda)`: derivative-based
   log-throughput response modes derived from `T0_b(lambda)`.
-- `ice_amount_obs`: known scalar ice amount for a specific observation.
-- `tau_ice(lambda)`: fitted ice optical-depth spectral shape.
+- `I(log10(lambda), h_obs)`: fitted ice log-throughput perturbation, evaluated
+  from a rectangular spline grid in log10 wavelength and ice thickness.
 
 ### Files
 
 - `passbands.txt`: supplied Roman nominal relative throughputs for six filters:
   `F062`, `F087`, `F106`, `F129`, `F158`, and `F184`.
+- `ice_loglam_nodes.txt`: default log10 wavelength nodes used for the ice
+  spline grid. The simulator can read a different node file.
 - `simulate_roman_passband_data.py`: generates six-filter photometry using
-  `passbands.txt`, passband modes, ice basis functions, and truth files.
+  `passbands.txt`, passband modes, a 2D ice spline surface, and truth files.
 - `fit_roman_passband_model.py`: reads the simulator products and runs an
   iterative sparse linearized fit.
 - `passband_sim_outputs/measurements.csv`: simulated flattened stellar
@@ -226,7 +228,10 @@ Notation:
 - `passband_sim_outputs/nominal_passbands.csv`: long-form nominal passbands.
 - `passband_sim_outputs/passband_modes.csv`: shift and width log-throughput
   modes.
-- `passband_sim_outputs/ice_basis.csv`: optical-depth basis functions.
+- `passband_sim_outputs/ice_spline_nodes.csv`: rectangular spline grid nodes in
+  log10 wavelength and ice thickness.
+- `passband_sim_outputs/true_ice_spline_params.csv`: true ice log-throughput
+  values at the spline grid nodes.
 - `passband_sim_outputs/true_*params.csv`: simulator truth files.
 - `passband_fit_outputs/fit_*params.csv`: recovered stellar, passband, and ice
   parameters.
@@ -250,6 +255,14 @@ Useful fitter options:
 /opt/anaconda3/bin/python fit_roman_passband_model.py --input-dir passband_sim_outputs --output-dir passband_fit_outputs
 ```
 
+Useful simulator options:
+
+```bash
+/opt/anaconda3/bin/python simulate_roman_passband_data.py --n-ice-thickness-nodes 7
+/opt/anaconda3/bin/python simulate_roman_passband_data.py --ice-loglam-nodes-file my_nodes.txt
+/opt/anaconda3/bin/python simulate_roman_passband_data.py --ice-thickness-min 0.0 --ice-thickness-max 1.5
+```
+
 The default simulator uses one detector, six supplied Roman passbands, `2,000`
 stars, and `30` exposures. The scripts are structured so the detector axis can
 be expanded later.
@@ -268,6 +281,7 @@ filter_name
 detector_id
 x
 y
+ice_thickness
 ice_amount_obs
 mag_obs
 mag_unc
@@ -277,8 +291,9 @@ true_passband_delta_mag
 true_ice_delta_mag
 ```
 
-`ice_amount_obs` is treated as known input to the fitter. The fitter recovers
-the spectral shape coefficients of `tau_ice(lambda)`, not a separate ice amount
+`ice_thickness` is treated as known input to the fitter. `ice_amount_obs` is
+kept as a backwards-compatible alias with the same value. The fitter recovers
+the node values of the 2D ice log-throughput surface, not a separate ice amount
 per observation.
 
 Column meanings:
@@ -295,8 +310,9 @@ Column meanings:
 - `detector_id`: one-based detector identifier. The default passband simulation
   uses detector `1`.
 - `x`, `y`: detector pixel coordinates for this observation.
-- `ice_amount_obs`: known relative ice amount for this observation, including
-  exposure/epoch variation and a small position dependence.
+- `ice_thickness`: known ice-thickness coordinate for this observation,
+  including exposure/epoch variation and a small position dependence.
+- `ice_amount_obs`: backwards-compatible alias of `ice_thickness`.
 - `mag_obs`: noisy simulated observed magnitude.
 - `mag_unc`: 1-sigma magnitude uncertainty used for row weighting.
 - `mag_true_no_noise`: noiseless simulated magnitude including SED, passband,
@@ -317,21 +333,22 @@ sparse linearized system for magnitude residuals and solve updates for:
 - per-star extinction-like parameter,
 - per-filter/per-detector passband shift,
 - per-filter/per-detector passband width,
-- global ice optical-depth basis coefficients.
+- global ice log-throughput spline node values.
 
-The response for each passband or ice basis mode is computed from the current
-stellar SED and current throughput with the proper broadband flux integral.
-Updates are damped before being applied.
+The response for each passband mode or ice spline node is computed from the
+current stellar SED and current throughput with the proper broadband flux
+integral. Updates are damped before being applied.
 
 ### Regularization And Degeneracies
 
 The chromatic problem has real degeneracies among stellar SED colors, passband
-color terms, and ice spectral shape. The fitter uses weighted pseudo-observation
+color terms, and ice surface modes. The fitter uses weighted pseudo-observation
 rows for weak priors:
 
 - passband shift prior: `sigma_shift_prior = 0.02 um`,
 - passband width prior: `sigma_width_prior = 0.05`,
-- ice coefficient prior: `sigma_ice_prior = 0.10`,
+- ice spline node prior: `sigma_ice_prior = 0.10`,
+- zero-thickness ice-surface prior: `sigma_zero_ice_surface_prior = 1e-4`,
 - stellar temperature update prior: `sigma_temp_update_prior = 400 K`,
 - stellar extinction update prior: `sigma_ext_update_prior = 0.05`.
 
@@ -345,25 +362,33 @@ sampled edges, the log-throughput derivatives are smoothed over a few wavelength
 samples and clipped before simulation. This keeps the injected perturbations in
 the small-signal regime needed by the linearized fitter.
 
+The ice model is a rectangular linear tensor-product spline. Log-wavelength
+nodes come from `ice_loglam_nodes.txt` or a user-specified file; ice-thickness
+nodes are uniformly spaced between `ice_thickness_min` and `ice_thickness_max`.
+The default has 9 log-wavelength nodes and 5 thickness nodes, so the ice block
+contains 45 fitted node values. The zero-thickness node row is strongly
+constrained to zero because zero ice thickness should produce no ice
+log-throughput perturbation.
+
 ### Default Verification
 
-A default run currently produces `55,071` observations and solves `6,015`
+A default run currently produces `55,071` observations and solves `6,057`
 linearized update parameters per iteration. The verified iteration summary is:
 
 ```text
 iteration  RMS residual [mag]
-0          0.010576
-1          0.010146
-2          0.006827
-3          0.005462
-4          0.005064
-5          0.004967
+0          0.009220
+1          0.014137
+2          0.008400
+3          0.005957
+4          0.005168
+5          0.004950
 ```
 
 Final default diagnostics:
 
 ```text
-Passband shift RMS error: 0.002498 um
-Passband width RMS error: 0.010528
-Ice optical-depth shape RMS error: 0.000368
+Passband shift RMS error: 0.003456 um
+Passband width RMS error: 0.005506
+Ice log-throughput surface RMS error: 0.009032
 ```

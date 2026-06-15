@@ -3,16 +3,17 @@
 
 This simulator assumes scalar instrumental calibration has already been applied.
 It focuses on chromatic calibration: small passband shifts, passband width
-changes, and wavelength-dependent ice throughput loss.
+changes, and ice-induced wavelength/thickness-dependent throughput changes.
 
-Throughput perturbations are modeled in log-throughput / optical-depth space,
-because small multiplicative throughput changes then add linearly. Observations
-are still generated from linear broadband flux integrals, which is the physical
+Throughput perturbations are modeled in log-throughput space because small
+multiplicative throughput changes then add linearly. Observations are still
+generated from linear broadband flux integrals, which is the physical
 measurement made by the detector.
 """
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import asdict, dataclass
 import json
 import os
@@ -43,6 +44,10 @@ class SimConfig:
     wave_max: float = 2.30
     n_wave: int = 2000
     passband_file: str = "passbands.txt"
+    ice_loglam_nodes_file: str = "ice_loglam_nodes.txt"
+    n_ice_thickness_nodes: int = 5
+    ice_thickness_min: float = 0.0
+    ice_thickness_max: float = 1.2
     phot_sigma_mag: float = 0.005
     output_dir: str = "passband_sim_outputs"
     detection_fraction: float = 0.92
@@ -144,12 +149,95 @@ def make_passband_modes(
     return phi_shift, phi_width
 
 
-def make_ice_basis(wave: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Three broad Gaussian optical-depth basis functions."""
-    centers = np.array([1.0, 1.5, 2.0])
-    widths = np.array([0.16, 0.22, 0.26])
-    basis = np.exp(-0.5 * ((wave[None, :] - centers[:, None]) / widths[:, None]) ** 2)
-    return basis, centers
+def read_ice_loglam_nodes(config: SimConfig, wave: np.ndarray) -> np.ndarray:
+    """Read log10 wavelength spline nodes from a user-specified file.
+
+    The file can be whitespace or comma separated. If it has a named column
+    `log10_wavelength`, that column is used; otherwise all numeric values in
+    the file are flattened and sorted.
+    """
+    path = Path(config.ice_loglam_nodes_file)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Missing ice log-wavelength node file: {path}. "
+            "Pass --ice-loglam-nodes-file or create the default file."
+        )
+
+    try:
+        nodes = np.loadtxt(path, comments="#", ndmin=1)
+    except Exception:
+        table = pd.read_csv(path, sep=None, engine="python", comment="#")
+        if "log10_wavelength" in table.columns:
+            nodes = table["log10_wavelength"].to_numpy(float)
+        else:
+            nodes = table.select_dtypes(include=[np.number]).to_numpy().ravel()
+
+    nodes = np.asarray(nodes, dtype=float)
+    nodes = np.unique(nodes[np.isfinite(nodes)])
+    if nodes.size < 2:
+        raise ValueError("At least two log10 wavelength nodes are required")
+
+    log_wave = np.log10(wave)
+    if nodes[0] > log_wave.min() or nodes[-1] < log_wave.max():
+        raise ValueError(
+            "Ice log-wavelength nodes must cover the passband wavelength grid: "
+            f"{log_wave.min():.6f} .. {log_wave.max():.6f}"
+        )
+    return nodes
+
+
+def make_ice_thickness_nodes(config: SimConfig) -> np.ndarray:
+    """Uniform ice-thickness nodes for the rectangular spline grid."""
+    if config.n_ice_thickness_nodes < 2:
+        raise ValueError("n_ice_thickness_nodes must be at least 2")
+    if config.ice_thickness_max <= config.ice_thickness_min:
+        raise ValueError("ice_thickness_max must be greater than ice_thickness_min")
+    return np.linspace(
+        config.ice_thickness_min,
+        config.ice_thickness_max,
+        config.n_ice_thickness_nodes,
+    )
+
+
+def make_true_ice_spline_values(
+    loglam_nodes: np.ndarray, thickness_nodes: np.ndarray
+) -> np.ndarray:
+    """Create a small oscillatory AR/interference-like log-throughput surface.
+
+    The values are log-throughput perturbations on the rectangular node grid.
+    A linear tensor-product spline interpolates between nodes. The surface is
+    zero at zero ice thickness and contains both absorption-like and oscillatory
+    terms, so it can represent interference effects rather than a separable
+    wavelength-only attenuation curve.
+    """
+    u = (loglam_nodes - loglam_nodes.min()) / (loglam_nodes.max() - loglam_nodes.min())
+    t = thickness_nodes / thickness_nodes.max()
+    uu, tt = np.meshgrid(u, t)
+    absorption = -0.010 * tt * (0.35 + 0.65 * uu)
+    ripple_1 = 0.04 * tt * np.sin(2.0 * np.pi * (2.2 * uu + 1.3 * tt))
+    ripple_2 = 0.04 * tt**1.4 * np.cos(2.0 * np.pi * (5.0 * uu - 0.7 * tt))
+    return absorption + ripple_1 + ripple_2
+
+
+def interpolate_ice_surface(
+    node_values: np.ndarray,
+    loglam_nodes: np.ndarray,
+    thickness_nodes: np.ndarray,
+    wave: np.ndarray,
+    thickness: float,
+) -> np.ndarray:
+    """Evaluate the linear tensor-product spline at one ice thickness."""
+    log_wave = np.log10(wave)
+    t = np.clip(thickness, thickness_nodes[0], thickness_nodes[-1])
+    hi = int(np.searchsorted(thickness_nodes, t, side="right"))
+    hi = np.clip(hi, 1, thickness_nodes.size - 1)
+    lo = hi - 1
+    denom = thickness_nodes[hi] - thickness_nodes[lo]
+    w_hi = 0.0 if denom == 0.0 else (t - thickness_nodes[lo]) / denom
+    w_lo = 1.0 - w_hi
+    surface_lo = np.interp(log_wave, loglam_nodes, node_values[lo])
+    surface_hi = np.interp(log_wave, loglam_nodes, node_values[hi])
+    return w_lo * surface_lo + w_hi * surface_hi
 
 
 def extinction_curve(wave: np.ndarray) -> np.ndarray:
@@ -199,7 +287,6 @@ def write_passband_files(
     passbands: np.ndarray,
     phi_shift: np.ndarray,
     phi_width: np.ndarray,
-    ice_basis: np.ndarray,
     filter_names: list[str],
 ) -> None:
     passband_rows = []
@@ -231,18 +318,40 @@ def write_passband_files(
     )
     pd.concat(mode_rows, ignore_index=True).to_csv(output_dir / "passband_modes.csv", index=False)
 
-    ice_rows = []
-    for basis_id in range(ice_basis.shape[0]):
-        ice_rows.append(
-            pd.DataFrame(
+
+def write_ice_spline_files(
+    output_dir: Path,
+    loglam_nodes: np.ndarray,
+    thickness_nodes: np.ndarray,
+    true_node_values: np.ndarray,
+) -> None:
+    """Write rectangular spline grid geometry and true log-throughput values."""
+    rows = []
+    for thick_id, thickness in enumerate(thickness_nodes):
+        for loglam_id, loglam in enumerate(loglam_nodes):
+            rows.append(
                 {
-                    "wavelength_um": wave,
-                    "basis_id": basis_id,
-                    "psi": ice_basis[basis_id],
+                    "ice_thickness_node_id": thick_id,
+                    "ice_thickness": thickness,
+                    "loglam_node_id": loglam_id,
+                    "log10_wavelength": loglam,
                 }
             )
-        )
-    pd.concat(ice_rows, ignore_index=True).to_csv(output_dir / "ice_basis.csv", index=False)
+    pd.DataFrame(rows).to_csv(output_dir / "ice_spline_nodes.csv", index=False)
+
+    true_rows = []
+    for thick_id, thickness in enumerate(thickness_nodes):
+        for loglam_id, loglam in enumerate(loglam_nodes):
+            true_rows.append(
+                {
+                    "ice_thickness_node_id": thick_id,
+                    "ice_thickness": thickness,
+                    "loglam_node_id": loglam_id,
+                    "log10_wavelength": loglam,
+                    "ice_logt_node_value": true_node_values[thick_id, loglam_id],
+                }
+            )
+    pd.DataFrame(true_rows).to_csv(output_dir / "true_ice_spline_params.csv", index=False)
 
 
 def simulate_data(config: SimConfig) -> None:
@@ -252,13 +361,14 @@ def simulate_data(config: SimConfig) -> None:
 
     wave, passbands, filter_centers, filter_names = read_nominal_passbands(config)
     phi_shift, phi_width = make_passband_modes(wave, passbands, filter_centers, config)
-    ice_basis, _ = make_ice_basis(wave)
-    true_ice_coeff = np.array([0.010, 0.018, 0.026])
-    tau_ice_true = true_ice_coeff @ ice_basis
+    loglam_nodes = read_ice_loglam_nodes(config, wave)
+    thickness_nodes = make_ice_thickness_nodes(config)
+    true_ice_node_values = make_true_ice_spline_values(loglam_nodes, thickness_nodes)
 
     write_passband_files(
-        output_dir, wave, passbands, phi_shift, phi_width, ice_basis, filter_names
+        output_dir, wave, passbands, phi_shift, phi_width, filter_names
     )
+    write_ice_spline_files(output_dir, loglam_nodes, thickness_nodes, true_ice_node_values)
 
     detector_ids = np.arange(1, config.n_det + 1, dtype=int)
     star_detector_index = np.arange(config.n_star, dtype=int) % config.n_det
@@ -303,10 +413,6 @@ def simulate_data(config: SimConfig) -> None:
             )
     pd.DataFrame(pass_rows).to_csv(output_dir / "true_passband_params.csv", index=False)
 
-    pd.DataFrame(
-        {"basis_id": np.arange(true_ice_coeff.size), "ice_coeff": true_ice_coeff}
-    ).to_csv(output_dir / "true_ice_params.csv", index=False)
-
     # One exposure uses one filter. The known ice amount has an epoch component
     # plus a weak detector-position component, resembling an RCS-derived scalar.
     exposure_filter = np.arange(config.n_exp, dtype=int) % config.n_filter
@@ -331,7 +437,11 @@ def simulate_data(config: SimConfig) -> None:
             y = star_y[star_id]
             position_term = 1.0 + 0.12 * (x / (config.nx - 1.0) - 0.5)
             position_term += 0.08 * (y / (config.ny - 1.0) - 0.5)
-            ice_amount = max(0.0, exposure_ice[exp_id] * position_term)
+            ice_thickness = np.clip(
+                exposure_ice[exp_id] * position_term,
+                config.ice_thickness_min,
+                config.ice_thickness_max,
+            )
 
             t0 = passbands[filt]
             sed = sed_all[star_id]
@@ -339,7 +449,10 @@ def simulate_data(config: SimConfig) -> None:
                 true_shift[filt, det_index] * phi_shift[filt]
                 + true_width[filt, det_index] * phi_width[filt]
             )
-            logt_true = logt_pass - ice_amount * tau_ice_true
+            logt_ice = interpolate_ice_surface(
+                true_ice_node_values, loglam_nodes, thickness_nodes, wave, ice_thickness
+            )
+            logt_true = logt_pass + logt_ice
             t_pass = t0 * np.exp(logt_pass)
             t_true = t0 * np.exp(logt_true)
 
@@ -362,7 +475,8 @@ def simulate_data(config: SimConfig) -> None:
                     "detector_id": det_id,
                     "x": x,
                     "y": y,
-                    "ice_amount_obs": ice_amount,
+                    "ice_thickness": ice_thickness,
+                    "ice_amount_obs": ice_thickness,
                     "mag_obs": mag_obs,
                     "mag_unc": config.phot_sigma_mag,
                     "mag_true_no_noise": mag_true,
@@ -382,11 +496,22 @@ def simulate_data(config: SimConfig) -> None:
     metadata["detector_ids"] = detector_ids.tolist()
     metadata["filter_names"] = filter_names
     metadata["filter_centers_um"] = filter_centers.tolist()
+    metadata["ice_loglam_nodes_file"] = config.ice_loglam_nodes_file
+    metadata["n_ice_loglam_nodes"] = int(loglam_nodes.size)
+    metadata["n_ice_thickness_nodes"] = int(thickness_nodes.size)
     metadata["n_obs"] = len(rows)
     with open(output_dir / "simulation_metadata.json", "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2, sort_keys=True)
 
-    make_diagnostic_plots(output_dir, wave, passbands, tau_ice_true, filter_names)
+    make_diagnostic_plots(
+        output_dir,
+        wave,
+        passbands,
+        filter_names,
+        loglam_nodes,
+        thickness_nodes,
+        true_ice_node_values,
+    )
 
     print(f"Saved {len(rows)} observations to {output_dir / 'measurements.csv'}")
     print(f"Saved simulator products to {output_dir.resolve()}")
@@ -396,8 +521,10 @@ def make_diagnostic_plots(
     output_dir: Path,
     wave: np.ndarray,
     passbands: np.ndarray,
-    tau_ice_true: np.ndarray,
     filter_names: list[str],
+    loglam_nodes: np.ndarray,
+    thickness_nodes: np.ndarray,
+    true_ice_node_values: np.ndarray,
 ) -> None:
     plt.figure(figsize=(8, 4.5))
     for filt in range(passbands.shape[0]):
@@ -410,18 +537,64 @@ def make_diagnostic_plots(
     plt.savefig(output_dir / "sim_nominal_passbands.png", dpi=160)
     plt.close()
 
-    plt.figure(figsize=(8, 4.5))
-    plt.plot(wave, tau_ice_true, color="tab:blue")
-    plt.xlabel("Wavelength [um]")
-    plt.ylabel("Optical depth per ice amount")
-    plt.title("True ice optical-depth shape")
+    log_wave = np.log10(wave)
+    thick_grid = np.linspace(thickness_nodes.min(), thickness_nodes.max(), 80)
+    surface = np.vstack(
+        [
+            interpolate_ice_surface(
+                true_ice_node_values, loglam_nodes, thickness_nodes, wave, thickness
+            )
+            for thickness in thick_grid
+        ]
+    )
+    vmax = np.max(np.abs(surface))
+    plt.figure(figsize=(8, 4.8))
+    im = plt.imshow(
+        surface,
+        origin="lower",
+        aspect="auto",
+        extent=[log_wave.min(), log_wave.max(), thick_grid.min(), thick_grid.max()],
+        cmap="coolwarm",
+        vmin=-vmax,
+        vmax=vmax,
+    )
+    plt.colorbar(im, label="log-throughput perturbation")
+    plt.scatter(
+        np.tile(loglam_nodes, thickness_nodes.size),
+        np.repeat(thickness_nodes, loglam_nodes.size),
+        s=8,
+        color="black",
+        alpha=0.55,
+    )
+    plt.xlabel("log10 wavelength [um]")
+    plt.ylabel("Ice thickness coordinate")
+    plt.title("True ice log-throughput surface")
     plt.tight_layout()
-    plt.savefig(output_dir / "sim_true_ice_tau.png", dpi=160)
+    plt.savefig(output_dir / "sim_true_ice_surface.png", dpi=160)
     plt.close()
 
 
+def parse_args() -> SimConfig:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-dir", default=SimConfig.output_dir)
+    parser.add_argument("--passband-file", default=SimConfig.passband_file)
+    parser.add_argument("--ice-loglam-nodes-file", default=SimConfig.ice_loglam_nodes_file)
+    parser.add_argument("--n-ice-thickness-nodes", type=int, default=SimConfig.n_ice_thickness_nodes)
+    parser.add_argument("--ice-thickness-min", type=float, default=SimConfig.ice_thickness_min)
+    parser.add_argument("--ice-thickness-max", type=float, default=SimConfig.ice_thickness_max)
+    args = parser.parse_args()
+    return SimConfig(
+        output_dir=args.output_dir,
+        passband_file=args.passband_file,
+        ice_loglam_nodes_file=args.ice_loglam_nodes_file,
+        n_ice_thickness_nodes=args.n_ice_thickness_nodes,
+        ice_thickness_min=args.ice_thickness_min,
+        ice_thickness_max=args.ice_thickness_max,
+    )
+
+
 def main() -> None:
-    simulate_data(SimConfig())
+    simulate_data(parse_args())
 
 
 if __name__ == "__main__":

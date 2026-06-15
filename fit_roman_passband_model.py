@@ -8,7 +8,8 @@ updates, damps the update, and repeats.
 
 The model is intentionally not production-grade. It is a compact prototype for
 studying identifiability and degeneracies among stellar SEDs, detector-level
-passband shifts/widths, and wavelength-dependent ice optical depth.
+passband shifts/widths, and a wavelength/thickness-dependent ice
+log-throughput surface.
 """
 
 from __future__ import annotations
@@ -48,6 +49,7 @@ class FitConfig:
     sigma_shift_prior: float = 0.02
     sigma_width_prior: float = 0.05
     sigma_ice_prior: float = 0.10
+    sigma_zero_ice_surface_prior: float = 1e-4
     sigma_temp_update_prior: float = 400.0
     sigma_ext_update_prior: float = 0.05
     temp_fd_step: float = 20.0
@@ -74,11 +76,13 @@ class DataBundle:
     passbands: np.ndarray
     phi_shift: np.ndarray
     phi_width: np.ndarray
-    ice_basis: np.ndarray
+    ice_loglam_nodes: np.ndarray
+    ice_thickness_nodes: np.ndarray
+    ice_loglam_basis: np.ndarray
     filter_effective_wavelength: np.ndarray
     true_star_params: pd.DataFrame | None
     true_passband_params: pd.DataFrame | None
-    true_ice_params: pd.DataFrame | None
+    true_ice_spline_params: pd.DataFrame | None
     sim_metadata: dict
 
 
@@ -158,6 +162,58 @@ def load_long_grid_csv(path: Path, value_columns: list[str], id_column: str) -> 
     return wave, values
 
 
+def load_ice_spline_nodes(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Load rectangular ice spline grid nodes from simulator output."""
+    table = pd.read_csv(path)
+    loglam_nodes = np.sort(table["log10_wavelength"].unique())
+    thickness_nodes = np.sort(table["ice_thickness"].unique())
+    expected = loglam_nodes.size * thickness_nodes.size
+    if len(table.drop_duplicates(["log10_wavelength", "ice_thickness"])) != expected:
+        raise ValueError("Ice spline node file is not a complete rectangular grid")
+    return loglam_nodes, thickness_nodes
+
+
+def make_loglam_basis(wave: np.ndarray, loglam_nodes: np.ndarray) -> np.ndarray:
+    """Linear spline basis functions evaluated on the wavelength grid."""
+    log_wave = np.log10(wave)
+    basis = np.zeros((loglam_nodes.size, wave.size))
+    for node_id in range(loglam_nodes.size):
+        unit = np.zeros(loglam_nodes.size)
+        unit[node_id] = 1.0
+        basis[node_id] = np.interp(log_wave, loglam_nodes, unit)
+    return basis
+
+
+def thickness_brackets(
+    thickness: np.ndarray, thickness_nodes: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return lower/upper node indices and linear interpolation weights."""
+    t = np.clip(thickness, thickness_nodes[0], thickness_nodes[-1])
+    hi = np.searchsorted(thickness_nodes, t, side="right")
+    hi = np.clip(hi, 1, thickness_nodes.size - 1)
+    lo = hi - 1
+    denom = thickness_nodes[hi] - thickness_nodes[lo]
+    w_hi = np.divide(t - thickness_nodes[lo], denom, out=np.zeros_like(t), where=denom != 0.0)
+    w_lo = 1.0 - w_hi
+    return lo, hi, w_lo, w_hi
+
+
+def evaluate_ice_surface_chunk(
+    ice_node_values: np.ndarray,
+    loglam_basis: np.ndarray,
+    thickness_nodes: np.ndarray,
+    thickness: np.ndarray,
+) -> np.ndarray:
+    """Evaluate the linear tensor-product spline for a chunk of observations."""
+    n_thick = thickness_nodes.size
+    n_loglam = loglam_basis.shape[0]
+    values = ice_node_values.reshape(n_thick, n_loglam)
+    lo, hi, w_lo, w_hi = thickness_brackets(thickness, thickness_nodes)
+    surface_lo = values[lo] @ loglam_basis
+    surface_hi = values[hi] @ loglam_basis
+    return w_lo[:, None] * surface_lo + w_hi[:, None] * surface_hi
+
+
 def load_data(config: FitConfig) -> DataBundle:
     input_dir = Path(config.input_dir)
     measurements = pd.read_csv(input_dir / "measurements.csv")
@@ -172,9 +228,12 @@ def load_data(config: FitConfig) -> DataBundle:
     wave_modes, mode_data = load_long_grid_csv(
         input_dir / "passband_modes.csv", ["phi_shift", "phi_width"], "filter_id"
     )
-    wave_ice, ice_data = load_long_grid_csv(input_dir / "ice_basis.csv", ["psi"], "basis_id")
-    if not np.allclose(wave, wave_modes) or not np.allclose(wave, wave_ice):
-        raise ValueError("Passband, mode, and ice-basis wavelength grids do not match")
+    if not np.allclose(wave, wave_modes):
+        raise ValueError("Passband and mode wavelength grids do not match")
+    ice_loglam_nodes, ice_thickness_nodes = load_ice_spline_nodes(
+        input_dir / "ice_spline_nodes.csv"
+    )
+    ice_loglam_basis = make_loglam_basis(wave, ice_loglam_nodes)
 
     filter_ids = np.sort(measurements["filter_id"].unique())
     detector_ids = np.sort(measurements["detector_id"].unique())
@@ -203,7 +262,6 @@ def load_data(config: FitConfig) -> DataBundle:
     passbands = pass_data["throughput"][pass_indices]
     phi_shift = mode_data["phi_shift"][pass_indices]
     phi_width = mode_data["phi_width"][pass_indices]
-    ice_basis = ice_data["psi"]
 
     denom = trapz_integral(passbands, wave, axis=1)
     filter_eff = trapz_integral(passbands * wave[None, :], wave, axis=1) / denom
@@ -231,11 +289,13 @@ def load_data(config: FitConfig) -> DataBundle:
         passbands=passbands,
         phi_shift=phi_shift,
         phi_width=phi_width,
-        ice_basis=ice_basis,
+        ice_loglam_nodes=ice_loglam_nodes,
+        ice_thickness_nodes=ice_thickness_nodes,
+        ice_loglam_basis=ice_loglam_basis,
         filter_effective_wavelength=filter_eff,
         true_star_params=read_optional("true_star_params.csv"),
         true_passband_params=read_optional("true_passband_params.csv"),
-        true_ice_params=read_optional("true_ice_params.csv"),
+        true_ice_spline_params=read_optional("true_ice_spline_params.csv"),
         sim_metadata=sim_metadata,
     )
 
@@ -287,7 +347,7 @@ def fit_initial_stellar_seds(data: DataBundle) -> ModelState:
 
     shift = np.zeros((data.filter_ids.size, data.detector_ids.size))
     width = np.zeros_like(shift)
-    ice_coeff = np.zeros(data.ice_basis.shape[0])
+    ice_coeff = np.zeros(data.ice_thickness_nodes.size * data.ice_loglam_nodes.size)
     return ModelState(mag_norm, temperature, extinction, shift, width, ice_coeff)
 
 
@@ -300,7 +360,7 @@ def evaluate_model_and_responses(
     derivative is computed from the correct linear flux integral over wavelength.
     """
     n_obs = len(data.measurements)
-    n_ice = data.ice_basis.shape[0]
+    n_ice = data.ice_thickness_nodes.size * data.ice_loglam_nodes.size
     mag_model = np.zeros(n_obs)
     d_norm = np.ones(n_obs)
     d_temp = np.zeros(n_obs)
@@ -309,8 +369,10 @@ def evaluate_model_and_responses(
     r_width = np.zeros(n_obs)
     r_ice = np.zeros((n_obs, n_ice))
 
-    ice_amount = data.measurements["ice_amount_obs"].to_numpy(float)
-    tau = state.ice_coeff @ data.ice_basis
+    if "ice_thickness" in data.measurements.columns:
+        ice_thickness = data.measurements["ice_thickness"].to_numpy(float)
+    else:
+        ice_thickness = data.measurements["ice_amount_obs"].to_numpy(float)
 
     for start in range(0, n_obs, config.chunk_size):
         end = min(n_obs, start + config.chunk_size)
@@ -318,7 +380,7 @@ def evaluate_model_and_responses(
         star = data.star_param_id[sl]
         filt = data.filter_param_id[sl]
         det = data.detector_param_id[sl]
-        ice = ice_amount[sl]
+        ice = ice_thickness[sl]
 
         sed = stellar_sed(
             data.wave,
@@ -329,7 +391,12 @@ def evaluate_model_and_responses(
         logt = (
             state.shift[filt, det][:, None] * data.phi_shift[filt]
             + state.width[filt, det][:, None] * data.phi_width[filt]
-            - ice[:, None] * tau[None, :]
+            + evaluate_ice_surface_chunk(
+                state.ice_coeff,
+                data.ice_loglam_basis,
+                data.ice_thickness_nodes,
+                ice,
+            )
         )
         t_current = data.passbands[filt] * np.exp(logt)
         weighted = sed * t_current
@@ -385,9 +452,28 @@ def evaluate_model_and_responses(
         r_width[sl] = -MAG_FACTOR * (
             trapz_integral(weighted * data.phi_width[filt], data.wave, axis=1) / denom
         )
-        for basis_id in range(n_ice):
-            numerator = trapz_integral(weighted * data.ice_basis[basis_id][None, :], data.wave, axis=1)
-            r_ice[sl, basis_id] = MAG_FACTOR * ice * numerator / denom
+        n_loglam = data.ice_loglam_nodes.size
+        lo, hi, w_lo, w_hi = thickness_brackets(ice, data.ice_thickness_nodes)
+        loglam_integrals = np.zeros((end - start, n_loglam))
+        for loglam_id in range(n_loglam):
+            loglam_integrals[:, loglam_id] = trapz_integral(
+                weighted * data.ice_loglam_basis[loglam_id][None, :],
+                data.wave,
+                axis=1,
+            )
+        # The ice spline enters as ln T += node_value * basis, so a positive
+        # node value increases flux and decreases magnitude. The sign is
+        # therefore negative.
+        for local_row in range(end - start):
+            for loglam_id in range(n_loglam):
+                r_ice[start + local_row, lo[local_row] * n_loglam + loglam_id] += (
+                    -MAG_FACTOR * w_lo[local_row] * loglam_integrals[local_row, loglam_id]
+                    / denom[local_row]
+                )
+                r_ice[start + local_row, hi[local_row] * n_loglam + loglam_id] += (
+                    -MAG_FACTOR * w_hi[local_row] * loglam_integrals[local_row, loglam_id]
+                    / denom[local_row]
+                )
 
     return Linearization(mag_model, d_norm, d_temp, d_ext, r_shift, r_width, r_ice)
 
@@ -395,7 +481,7 @@ def evaluate_model_and_responses(
 def parameter_slices(data: DataBundle) -> dict[str, slice]:
     n_star = data.star_ids.size
     n_pass = data.filter_ids.size * data.detector_ids.size
-    n_ice = data.ice_basis.shape[0]
+    n_ice = data.ice_thickness_nodes.size * data.ice_loglam_nodes.size
     start = 0
     slices = {}
     slices["norm"] = slice(start, start + n_star)
@@ -443,7 +529,7 @@ def build_sparse_system(
             (slices["shift"].start + pass_index, lin.r_shift[obs_index]),
             (slices["width"].start + pass_index, lin.r_width[obs_index]),
         ]
-        for basis_id in range(data.ice_basis.shape[0]):
+        for basis_id in range(data.ice_thickness_nodes.size * data.ice_loglam_nodes.size):
             entries.append((slices["ice"].start + basis_id, lin.r_ice[obs_index, basis_id]))
 
         for col, value in entries:
@@ -474,6 +560,18 @@ def build_sparse_system(
         cols.append(slices["ice"].start + basis_id)
         vals.append(1.0 / config.sigma_ice_prior)
         rhs.append(-current / config.sigma_ice_prior)
+        row += 1
+
+    # At exactly zero ice thickness, the ice perturbation is physically zero.
+    # This removes a gauge freedom between the ice surface and stellar/passband
+    # color terms without constraining nonzero-thickness interference structure.
+    n_loglam = data.ice_loglam_nodes.size
+    for loglam_id in range(n_loglam):
+        current = state.ice_coeff[loglam_id]
+        rows.append(row)
+        cols.append(slices["ice"].start + loglam_id)
+        vals.append(1.0 / config.sigma_zero_ice_surface_prior)
+        rhs.append(-current / config.sigma_zero_ice_surface_prior)
         row += 1
 
     # SED color/extinction update priors prevent each star from freely absorbing
@@ -516,6 +614,18 @@ def apply_update(
 
 def rms(values: np.ndarray) -> float:
     return float(np.sqrt(np.mean(values**2)))
+
+
+def ice_surface_on_grid(data: DataBundle, ice_node_values: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Evaluate ice log-throughput surface on a dense thickness/wavelength grid."""
+    thickness_grid = np.linspace(data.ice_thickness_nodes.min(), data.ice_thickness_nodes.max(), 80)
+    surface = evaluate_ice_surface_chunk(
+        ice_node_values,
+        data.ice_loglam_basis,
+        data.ice_thickness_nodes,
+        thickness_grid,
+    )
+    return np.log10(data.wave), thickness_grid, surface
 
 
 def run_fit(data: DataBundle, config: FitConfig) -> tuple[ModelState, pd.DataFrame, np.ndarray]:
@@ -574,12 +684,16 @@ def make_truth_arrays(data: DataBundle) -> tuple[np.ndarray | None, np.ndarray |
                     true_shift[filt_i, det_i] = row.iloc[0]["delta_lambda_um"]
                     true_width[filt_i, det_i] = row.iloc[0]["width"]
 
-    if data.true_ice_params is not None:
-        true_ice = np.zeros(data.ice_basis.shape[0])
-        for _, row in data.true_ice_params.iterrows():
-            basis_id = int(row["basis_id"])
-            if 0 <= basis_id < true_ice.size:
-                true_ice[basis_id] = row["ice_coeff"]
+    if data.true_ice_spline_params is not None:
+        n_thick = data.ice_thickness_nodes.size
+        n_loglam = data.ice_loglam_nodes.size
+        true_ice = np.zeros(n_thick * n_loglam)
+        for _, row in data.true_ice_spline_params.iterrows():
+            thick_id = int(row["ice_thickness_node_id"])
+            loglam_id = int(row["loglam_node_id"])
+            index = thick_id * n_loglam + loglam_id
+            if 0 <= index < true_ice.size:
+                true_ice[index] = row["ice_logt_node_value"]
 
     return true_shift, true_width, true_ice
 
@@ -617,9 +731,21 @@ def save_outputs(
             )
     pd.DataFrame(pass_rows).to_csv(output_dir / "fit_passband_params.csv", index=False)
 
-    pd.DataFrame(
-        {"basis_id": np.arange(state.ice_coeff.size), "ice_coeff": state.ice_coeff}
-    ).to_csv(output_dir / "fit_ice_params.csv", index=False)
+    ice_rows = []
+    n_loglam = data.ice_loglam_nodes.size
+    for thick_id, thickness in enumerate(data.ice_thickness_nodes):
+        for loglam_id, loglam in enumerate(data.ice_loglam_nodes):
+            index = thick_id * n_loglam + loglam_id
+            ice_rows.append(
+                {
+                    "ice_thickness_node_id": thick_id,
+                    "ice_thickness": thickness,
+                    "loglam_node_id": loglam_id,
+                    "log10_wavelength": loglam,
+                    "ice_logt_node_value": state.ice_coeff[index],
+                }
+            )
+    pd.DataFrame(ice_rows).to_csv(output_dir / "fit_ice_spline_params.csv", index=False)
 
     summary.to_csv(output_dir / "fit_iteration_summary.csv", index=False)
 
@@ -648,7 +774,7 @@ def print_diagnostics(
     print(f"Number of filters: {data.filter_ids.size}")
     print(f"Number of detectors: {data.detector_ids.size}")
     n_params = 3 * data.star_ids.size + 2 * data.filter_ids.size * data.detector_ids.size
-    n_params += data.ice_basis.shape[0]
+    n_params += data.ice_thickness_nodes.size * data.ice_loglam_nodes.size
     print(f"Number of fitted linearized parameters per iteration: {n_params}")
     print(f"Initial RMS residual: {summary.iloc[0]['rms_residual']:.6f} mag")
     print(f"Final RMS residual: {rms(final_resid):.6f} mag")
@@ -668,19 +794,11 @@ def print_diagnostics(
     if true_width is not None:
         print(f"Passband width RMS error: {rms(state.width - true_width):.6f}")
     if true_ice is not None:
-        true_tau = true_ice @ data.ice_basis
-        fit_tau = state.ice_coeff @ data.ice_basis
-        print(f"Ice optical-depth shape RMS error: {rms(fit_tau - true_tau):.6f}")
-
-    fit_tau = state.ice_coeff @ data.ice_basis
-    negative_fraction = np.mean(fit_tau < -1e-3)
-    if negative_fraction > 0.1:
-        print(
-            "WARNING: recovered tau_ice(lambda) is negative over "
-            f"{negative_fraction:.1%} of the wavelength grid."
-        )
+        _, _, true_surface = ice_surface_on_grid(data, true_ice)
+        _, _, fit_surface = ice_surface_on_grid(data, state.ice_coeff)
+        print(f"Ice log-throughput surface RMS error: {rms(fit_surface - true_surface):.6f}")
     print(
-        "Note: stellar extinction, passband color terms, and ice shape remain "
+        "Note: stellar extinction, passband color terms, and ice surface modes remain "
         "partially degenerate; recovery depends on priors and ice-amount leverage."
     )
 
@@ -736,15 +854,37 @@ def make_plots(
         plt.close()
 
     if true_ice is not None:
-        plt.figure(figsize=(7, 4.5))
-        plt.plot(data.wave, true_ice @ data.ice_basis, label="true")
-        plt.plot(data.wave, state.ice_coeff @ data.ice_basis, label="fit")
-        plt.xlabel("Wavelength [um]")
-        plt.ylabel("Optical depth per ice amount")
-        plt.title("Ice optical-depth shape")
-        plt.legend()
+        log_wave, thickness_grid, true_surface = ice_surface_on_grid(data, true_ice)
+        _, _, fit_surface = ice_surface_on_grid(data, state.ice_coeff)
+        resid_surface = fit_surface - true_surface
+        vmax = np.max(np.abs(np.r_[true_surface.ravel(), fit_surface.ravel()]))
+        rvmax = np.max(np.abs(resid_surface))
+        extent = [log_wave.min(), log_wave.max(), thickness_grid.min(), thickness_grid.max()]
+
+        plt.figure(figsize=(12, 4.2))
+        for panel, image, title, limit in (
+            (1, true_surface, "True", vmax),
+            (2, fit_surface, "Fit", vmax),
+            (3, resid_surface, "Fit - true", rvmax),
+        ):
+            plt.subplot(1, 3, panel)
+            im = plt.imshow(
+                image,
+                origin="lower",
+                aspect="auto",
+                extent=extent,
+                cmap="coolwarm",
+                vmin=-limit,
+                vmax=limit,
+            )
+            plt.title(title)
+            plt.xlabel("log10 wavelength [um]")
+            if panel == 1:
+                plt.ylabel("Ice thickness")
+            plt.colorbar(im, fraction=0.046, pad=0.04)
+        plt.suptitle("Ice log-throughput surface")
         plt.tight_layout()
-        plt.savefig(output_dir / "ice_tau_true_vs_fit.png", dpi=160)
+        plt.savefig(output_dir / "ice_surface_true_vs_fit.png", dpi=160)
         plt.close()
 
     filt = data.filter_param_id
@@ -763,13 +903,19 @@ def make_plots(
     plt.close()
 
     plt.figure(figsize=(7, 4.5))
-    plt.scatter(data.measurements["ice_amount_obs"], final_resid, s=4, alpha=0.25)
+    if "ice_thickness" in data.measurements.columns:
+        ice_x = data.measurements["ice_thickness"]
+        ice_label = "ice_thickness"
+    else:
+        ice_x = data.measurements["ice_amount_obs"]
+        ice_label = "ice_amount_obs"
+    plt.scatter(ice_x, final_resid, s=4, alpha=0.25)
     plt.axhline(0.0, color="0.3", linewidth=1)
-    plt.xlabel("ice_amount_obs")
+    plt.xlabel(ice_label)
     plt.ylabel("Residual [mag]")
-    plt.title("Residual versus ice amount")
+    plt.title("Residual versus ice thickness")
     plt.tight_layout()
-    plt.savefig(output_dir / "residual_vs_ice_amount.png", dpi=160)
+    plt.savefig(output_dir / "residual_vs_ice_thickness.png", dpi=160)
     plt.close()
 
     if data.true_star_params is not None:
