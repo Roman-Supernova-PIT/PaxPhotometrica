@@ -377,18 +377,18 @@ linearized update parameters per iteration. The verified iteration summary is:
 
 ```text
 iteration  RMS residual [mag]
-0          0.009220
-1          0.014137
-2          0.008400
-3          0.005957
-4          0.005168
-5          0.004950
+0          0.011891
+1          0.020244
+2          0.011342
+3          0.007179
+4          0.005564
+5          0.005058
 ```
 
 Final default diagnostics:
 
 ```text
-Passband shift RMS error: 0.003456 um
-Passband width RMS error: 0.005506
-Ice log-throughput surface RMS error: 0.009032
+Passband shift RMS error: 0.004273 um
+Passband width RMS error: 0.003938
+Ice log-throughput surface RMS error: 0.011814
 ```

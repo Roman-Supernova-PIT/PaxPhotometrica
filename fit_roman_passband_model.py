@@ -814,6 +814,44 @@ def make_plots(
     output_dir.mkdir(parents=True, exist_ok=True)
     true_shift, true_width, true_ice = make_truth_arrays(data)
 
+    def plot_passband_recovery(true_values, fit_values, xlabel, ylabel, title, filename):
+        lim = 1.1 * np.max(np.abs(np.r_[true_values.ravel(), fit_values.ravel()]))
+        lim = max(lim, 1e-6)
+        plt.figure(figsize=(6.2, 5.8))
+        cmap = plt.get_cmap("tab10")
+        for filt_i, filter_name in enumerate(data.filter_names):
+            color = cmap(filt_i % 10)
+            plt.scatter(
+                true_values[filt_i],
+                fit_values[filt_i],
+                s=52,
+                color=color,
+                label=filter_name,
+                alpha=0.9,
+            )
+            x_med = np.median(true_values[filt_i])
+            y_med = np.median(fit_values[filt_i])
+            plt.annotate(
+                filter_name,
+                (x_med, y_med),
+                xytext=(5, 4),
+                textcoords="offset points",
+                fontsize=8,
+                color=color,
+            )
+        plt.plot([-lim, lim], [-lim, lim], color="0.2", linewidth=1)
+        plt.xlabel(xlabel)
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.xlim(-lim, lim)
+        plt.ylim(-lim, lim)
+        plt.gca().set_aspect("equal", adjustable="box")
+        if data.detector_ids.size > 1:
+            plt.legend(ncol=2, fontsize=8)
+        plt.tight_layout()
+        plt.savefig(output_dir / filename, dpi=160)
+        plt.close()
+
     plt.figure(figsize=(6.5, 4.5))
     plt.plot(summary["iteration"], summary["rms_residual"], marker="o")
     plt.xlabel("Iteration")
@@ -824,34 +862,24 @@ def make_plots(
     plt.close()
 
     if true_shift is not None:
-        lim = 1.1 * np.max(np.abs(np.r_[true_shift.ravel(), state.shift.ravel()]))
-        plt.figure(figsize=(5.5, 5.5))
-        plt.scatter(true_shift.ravel(), state.shift.ravel(), s=45)
-        plt.plot([-lim, lim], [-lim, lim], color="0.2", linewidth=1)
-        plt.xlabel("True shift [um]")
-        plt.ylabel("Fitted shift [um]")
-        plt.title("Passband shift recovery")
-        plt.xlim(-lim, lim)
-        plt.ylim(-lim, lim)
-        plt.gca().set_aspect("equal", adjustable="box")
-        plt.tight_layout()
-        plt.savefig(output_dir / "passband_shift_true_vs_fit.png", dpi=160)
-        plt.close()
+        plot_passband_recovery(
+            true_shift,
+            state.shift,
+            "True shift [um]",
+            "Fitted shift [um]",
+            "Passband shift recovery",
+            "passband_shift_true_vs_fit.png",
+        )
 
     if true_width is not None:
-        lim = 1.1 * np.max(np.abs(np.r_[true_width.ravel(), state.width.ravel()]))
-        plt.figure(figsize=(5.5, 5.5))
-        plt.scatter(true_width.ravel(), state.width.ravel(), s=45)
-        plt.plot([-lim, lim], [-lim, lim], color="0.2", linewidth=1)
-        plt.xlabel("True width coefficient")
-        plt.ylabel("Fitted width coefficient")
-        plt.title("Passband width recovery")
-        plt.xlim(-lim, lim)
-        plt.ylim(-lim, lim)
-        plt.gca().set_aspect("equal", adjustable="box")
-        plt.tight_layout()
-        plt.savefig(output_dir / "passband_width_true_vs_fit.png", dpi=160)
-        plt.close()
+        plot_passband_recovery(
+            true_width,
+            state.width,
+            "True width coefficient",
+            "Fitted width coefficient",
+            "Passband width recovery",
+            "passband_width_true_vs_fit.png",
+        )
 
     if true_ice is not None:
         log_wave, thickness_grid, true_surface = ice_surface_on_grid(data, true_ice)
@@ -939,11 +967,28 @@ def make_plots(
         plt.savefig(output_dir / "stellar_param_recovery.png", dpi=160)
         plt.close()
 
-    plt.figure(figsize=(7, 4.5))
-    plt.hist(final_resid, bins=60, histtype="stepfilled", alpha=0.75)
+    bins = np.linspace(
+        np.percentile(final_resid, 0.2),
+        np.percentile(final_resid, 99.8),
+        50,
+    )
+    plt.figure(figsize=(9, 5))
+    cmap = plt.get_cmap("tab10")
+    for filt_i, filter_name in enumerate(data.filter_names):
+        mask = data.filter_param_id == filt_i
+        plt.hist(
+            final_resid[mask],
+            bins=bins,
+            histtype="step",
+            linewidth=1.4,
+            color=cmap(filt_i % 10),
+            label=filter_name,
+        )
+    plt.axvline(0.0, color="0.3", linewidth=1)
     plt.xlabel("Residual [mag]")
     plt.ylabel("Count")
-    plt.title("Residual histogram")
+    plt.title("Residual histogram by filter")
+    plt.legend(ncol=3, fontsize=8)
     plt.tight_layout()
     plt.savefig(output_dir / "residual_histogram.png", dpi=160)
     plt.close()

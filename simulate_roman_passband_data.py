@@ -214,8 +214,8 @@ def make_true_ice_spline_values(
     t = thickness_nodes / thickness_nodes.max()
     uu, tt = np.meshgrid(u, t)
     absorption = -0.010 * tt * (0.35 + 0.65 * uu)
-    ripple_1 = 0.04 * tt * np.sin(2.0 * np.pi * (2.2 * uu + 1.3 * tt))
-    ripple_2 = 0.04 * tt**1.4 * np.cos(2.0 * np.pi * (5.0 * uu - 0.7 * tt))
+    ripple_1 = 0.06 * tt * np.sin(2.0 * np.pi * (2.2 * uu + 1.3 * tt))
+    ripple_2 = 0.06 * tt**1.4 * np.cos(2.0 * np.pi * (5.0 * uu - 0.7 * tt))
     return absorption + ripple_1 + ripple_2
 
 
