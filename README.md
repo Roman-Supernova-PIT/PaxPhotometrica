@@ -235,6 +235,8 @@ Notation:
 - `passband_sim_outputs/true_*params.csv`: simulator truth files.
 - `passband_fit_outputs/fit_*params.csv`: recovered stellar, passband, and ice
   parameters.
+- `passband_fit_outputs/fit_ice_spline_params.csv`: recovered ice spline node
+  values and formal node uncertainties from the final LSQR variance estimate.
 - `passband_fit_outputs/fit_iteration_summary.csv`: residual RMS by iteration.
 - `passband_fit_outputs/fit_residuals.csv`: observation table plus final
   residuals.
@@ -339,6 +341,13 @@ The response for each passband mode or ice spline node is computed from the
 current stellar SED and current throughput with the proper broadband flux
 integral. Updates are damped before being applied.
 
+After the final iteration, the fitter rebuilds the weighted linearized system
+and runs SciPy `lsqr` with `calc_var=True`. This gives a formal diagonal
+variance estimate for the fitted update parameters. The ice-surface uncertainty
+panel propagates only those diagonal node variances through the rectangular
+spline basis; it intentionally ignores off-diagonal covariance, so it should be
+read as a quick diagnostic rather than a full posterior uncertainty surface.
+
 ### Regularization And Degeneracies
 
 The chromatic problem has real degeneracies among stellar SED colors, passband
@@ -391,4 +400,5 @@ Final default diagnostics:
 Passband shift RMS error: 0.004273 um
 Passband width RMS error: 0.003938
 Ice log-throughput surface RMS error: 0.011814
+Median formal ice-node uncertainty: 0.006953
 ```

@@ -33,7 +33,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.sparse import coo_matrix
-from scipy.sparse.linalg import lsmr
+from scipy.sparse.linalg import lsmr, lsqr
 
 
 MAG_FACTOR = 2.5 / np.log(10.0)
@@ -628,6 +628,30 @@ def ice_surface_on_grid(data: DataBundle, ice_node_values: np.ndarray) -> tuple[
     return np.log10(data.wave), thickness_grid, surface
 
 
+def ice_surface_uncertainty_on_grid(
+    data: DataBundle, ice_node_sigma: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Propagate diagonal node variances to the dense ice surface grid.
+
+    This intentionally ignores off-diagonal covariance. It is a useful formal
+    1-sigma diagnostic from LSQR's diagonal variance estimate, not a complete
+    posterior uncertainty surface.
+    """
+    thickness_grid = np.linspace(data.ice_thickness_nodes.min(), data.ice_thickness_nodes.max(), 80)
+    n_loglam = data.ice_loglam_nodes.size
+    sigma_grid = ice_node_sigma.reshape(data.ice_thickness_nodes.size, n_loglam)
+    lo, hi, w_lo, w_hi = thickness_brackets(thickness_grid, data.ice_thickness_nodes)
+    basis2 = data.ice_loglam_basis**2
+    sigma_surface = np.zeros((thickness_grid.size, data.wave.size))
+    for row in range(thickness_grid.size):
+        node_var = (
+            w_lo[row] ** 2 * sigma_grid[lo[row]] ** 2
+            + w_hi[row] ** 2 * sigma_grid[hi[row]] ** 2
+        )
+        sigma_surface[row] = np.sqrt(np.maximum(node_var @ basis2, 0.0))
+    return np.log10(data.wave), thickness_grid, sigma_surface
+
+
 def run_fit(data: DataBundle, config: FitConfig) -> tuple[ModelState, pd.DataFrame, np.ndarray]:
     state = fit_initial_stellar_seds(data)
     output_rows = []
@@ -664,6 +688,42 @@ def run_fit(data: DataBundle, config: FitConfig) -> tuple[ModelState, pd.DataFra
     final_lin = evaluate_model_and_responses(data, state, config, need_responses=False)
     final_resid = obs_mag - final_lin.mag_model
     return state, pd.DataFrame(output_rows), final_resid
+
+
+def estimate_parameter_uncertainties(
+    data: DataBundle, state: ModelState, config: FitConfig
+) -> tuple[np.ndarray, dict[str, slice], dict[str, float]]:
+    """Estimate formal 1-sigma parameter uncertainties with LSQR.
+
+    SciPy's LSMR solver does not expose variance estimates. LSQR can estimate
+    the diagonal of ``inv(A.T @ A)`` when ``calc_var=True``. Because all rows in
+    this prototype are already weighted by their data or prior sigma, the square
+    root of that diagonal is a formal linearized 1-sigma uncertainty estimate.
+    We scale by the reduced chi-square of the final linearized solve so the
+    values are not overconfident if the weighted residuals are larger than one.
+    """
+    print("Estimating formal parameter uncertainties with LSQR...")
+    lin = evaluate_model_and_responses(data, state, config, need_responses=True)
+    A, b, slices = build_sparse_system(data, state, lin, config)
+    result = lsqr(
+        A,
+        b,
+        atol=1e-9,
+        btol=1e-9,
+        iter_lim=4000,
+        show=False,
+        calc_var=True,
+    )
+    var = np.maximum(result[-1], 0.0)
+    dof = max(A.shape[0] - A.shape[1], 1)
+    reduced_chi2 = (result[3] ** 2) / dof
+    sigma = np.sqrt(var * max(reduced_chi2, 1e-12))
+    info = {
+        "lsqr_uncertainty_stop_code": float(result[1]),
+        "lsqr_uncertainty_iterations": float(result[2]),
+        "lsqr_uncertainty_reduced_chi2": float(reduced_chi2),
+    }
+    return sigma, slices, info
 
 
 def make_truth_arrays(data: DataBundle) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
@@ -704,6 +764,9 @@ def save_outputs(
     summary: pd.DataFrame,
     final_resid: np.ndarray,
     config: FitConfig,
+    param_sigma: np.ndarray | None = None,
+    slices: dict[str, slice] | None = None,
+    uncertainty_info: dict[str, float] | None = None,
 ) -> None:
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -729,6 +792,12 @@ def save_outputs(
                     "width": state.width[filt_i, det_i],
                 }
             )
+            if param_sigma is not None and slices is not None:
+                pass_index = filt_i * data.detector_ids.size + det_i
+                pass_rows[-1]["delta_lambda_um_sigma"] = param_sigma[
+                    slices["shift"].start + pass_index
+                ]
+                pass_rows[-1]["width_sigma"] = param_sigma[slices["width"].start + pass_index]
     pd.DataFrame(pass_rows).to_csv(output_dir / "fit_passband_params.csv", index=False)
 
     ice_rows = []
@@ -745,6 +814,8 @@ def save_outputs(
                     "ice_logt_node_value": state.ice_coeff[index],
                 }
             )
+            if param_sigma is not None and slices is not None:
+                ice_rows[-1]["ice_logt_node_sigma"] = param_sigma[slices["ice"].start + index]
     pd.DataFrame(ice_rows).to_csv(output_dir / "fit_ice_spline_params.csv", index=False)
 
     summary.to_csv(output_dir / "fit_iteration_summary.csv", index=False)
@@ -754,7 +825,10 @@ def save_outputs(
     residuals.to_csv(output_dir / "fit_residuals.csv", index=False)
 
     with open(output_dir / "fit_config.json", "w", encoding="utf-8") as handle:
-        json.dump(config.__dict__, handle, indent=2, sort_keys=True)
+        payload = dict(config.__dict__)
+        if uncertainty_info is not None:
+            payload.update(uncertainty_info)
+        json.dump(payload, handle, indent=2, sort_keys=True)
 
     # Copy metadata for convenience when fit outputs are inspected standalone.
     meta_path = Path(config.input_dir) / "simulation_metadata.json"
@@ -763,7 +837,12 @@ def save_outputs(
 
 
 def print_diagnostics(
-    data: DataBundle, state: ModelState, summary: pd.DataFrame, final_resid: np.ndarray
+    data: DataBundle,
+    state: ModelState,
+    summary: pd.DataFrame,
+    final_resid: np.ndarray,
+    param_sigma: np.ndarray | None = None,
+    slices: dict[str, slice] | None = None,
 ) -> None:
     true_shift, true_width, true_ice = make_truth_arrays(data)
 
@@ -797,6 +876,9 @@ def print_diagnostics(
         _, _, true_surface = ice_surface_on_grid(data, true_ice)
         _, _, fit_surface = ice_surface_on_grid(data, state.ice_coeff)
         print(f"Ice log-throughput surface RMS error: {rms(fit_surface - true_surface):.6f}")
+    if param_sigma is not None and slices is not None:
+        ice_sigma = param_sigma[slices["ice"]]
+        print(f"Median formal ice-node uncertainty: {np.median(ice_sigma):.6f}")
     print(
         "Note: stellar extinction, passband color terms, and ice surface modes remain "
         "partially degenerate; recovery depends on priors and ice-amount leverage."
@@ -809,6 +891,8 @@ def make_plots(
     summary: pd.DataFrame,
     final_resid: np.ndarray,
     config: FitConfig,
+    param_sigma: np.ndarray | None = None,
+    slices: dict[str, slice] | None = None,
 ) -> None:
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -889,27 +973,46 @@ def make_plots(
         rvmax = np.max(np.abs(resid_surface))
         extent = [log_wave.min(), log_wave.max(), thickness_grid.min(), thickness_grid.max()]
 
-        plt.figure(figsize=(12, 4.2))
-        for panel, image, title, limit in (
-            (1, true_surface, "True", vmax),
-            (2, fit_surface, "Fit", vmax),
-            (3, resid_surface, "Fit - true", rvmax),
-        ):
-            plt.subplot(1, 3, panel)
+        uncertainty_surface = None
+        if param_sigma is not None and slices is not None:
+            _, _, uncertainty_surface = ice_surface_uncertainty_on_grid(
+                data, param_sigma[slices["ice"]]
+            )
+
+        plt.figure(figsize=(11, 8.2))
+        panels = [
+            (1, true_surface, "True", "coolwarm", -vmax, vmax),
+            (2, fit_surface, "Fit", "coolwarm", -vmax, vmax),
+            (3, resid_surface, "Fit - true", "coolwarm", -rvmax, rvmax),
+        ]
+        if uncertainty_surface is not None:
+            panels.append(
+                (
+                    4,
+                    uncertainty_surface,
+                    "Formal 1-sigma uncertainty",
+                    "viridis",
+                    0.0,
+                    np.max(uncertainty_surface),
+                )
+            )
+        for panel, image, title, cmap, vmin, vmax_panel in panels:
+            plt.subplot(2, 2, panel)
             im = plt.imshow(
                 image,
                 origin="lower",
                 aspect="auto",
                 extent=extent,
-                cmap="coolwarm",
-                vmin=-limit,
-                vmax=limit,
+                cmap=cmap,
+                vmin=vmin,
+                vmax=vmax_panel,
             )
             plt.title(title)
             plt.xlabel("log10 wavelength [um]")
-            if panel == 1:
+            if panel in (1, 3):
                 plt.ylabel("Ice thickness")
-            plt.colorbar(im, fraction=0.046, pad=0.04)
+            label = "1-sigma log-throughput" if panel == 4 else "log-throughput"
+            plt.colorbar(im, fraction=0.046, pad=0.04, label=label)
         plt.suptitle("Ice log-throughput surface")
         plt.tight_layout()
         plt.savefig(output_dir / "ice_surface_true_vs_fit.png", dpi=160)
@@ -1016,9 +1119,19 @@ def main() -> None:
     config = parse_args()
     data = load_data(config)
     state, summary, final_resid = run_fit(data, config)
-    save_outputs(data, state, summary, final_resid, config)
-    print_diagnostics(data, state, summary, final_resid)
-    make_plots(data, state, summary, final_resid, config)
+    param_sigma, slices, uncertainty_info = estimate_parameter_uncertainties(data, state, config)
+    save_outputs(
+        data,
+        state,
+        summary,
+        final_resid,
+        config,
+        param_sigma=param_sigma,
+        slices=slices,
+        uncertainty_info=uncertainty_info,
+    )
+    print_diagnostics(data, state, summary, final_resid, param_sigma=param_sigma, slices=slices)
+    make_plots(data, state, summary, final_resid, config, param_sigma=param_sigma, slices=slices)
     print(f"Saved fit outputs to {Path(config.output_dir).resolve()}")
 
 
