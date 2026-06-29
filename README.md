@@ -291,7 +291,7 @@ Useful simulator options:
 ```
 
 The default simulator uses one detector, six supplied Roman passbands, `2,000`
-stars, `25` fixed absolute calibrator stars, and `30` exposures. The scripts
+stars, `5` fixed absolute calibrator stars, and `30` exposures. The scripts
 are structured so the detector axis can be expanded later.
 
 ### Stellar SED Basis
@@ -447,26 +447,26 @@ log-throughput perturbation.
 
 ### Default Verification
 
-A default run currently produces `55,023` observations, uses `25` fixed
-absolute calibrator stars, and solves `9,932` linearized update parameters per
+A default run currently produces `55,030` observations, uses `5` fixed
+absolute calibrator stars, and solves `10,032` linearized update parameters per
 iteration. The verified iteration summary is:
 
 ```text
 iteration  RMS residual [mag]
-0          0.015353
-1          0.008467
-2          0.005782
-3          0.004882
-4          0.004624
-5          0.004554
+0          0.024462
+1          0.011003
+2          0.006775
+3          0.005197
+4          0.004707
+5          0.004571
 ```
 
 Final default diagnostics:
 
 ```text
-Passband shift RMS error: 0.000186 um
-Passband width RMS error: 0.000636
-Ice log-throughput surface RMS error: 0.004771
-Stellar EMPCA coefficient RMS error: 0.069045
-Median formal ice-node uncertainty: 0.005782
+Passband shift RMS error: 0.000257 um
+Passband width RMS error: 0.003352
+Ice log-throughput surface RMS error: 0.012734
+Stellar EMPCA coefficient RMS error: 0.069927
+Median formal ice-node uncertainty: 0.005874
 ```
