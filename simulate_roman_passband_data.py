@@ -40,6 +40,7 @@ class SimConfig:
     nx: int = 4096
     ny: int = 4096
     n_filter: int = 6
+    n_absolute_calibrator: int = 25
     wave_min: float = 0.45
     wave_max: float = 2.30
     n_wave: int = 2000
@@ -400,6 +401,10 @@ def simulate_data(config: SimConfig) -> None:
     true_mag_norm = rng.uniform(18.0, 22.0, size=config.n_star)
     true_model_index = rng.integers(sed_library.coefficients.shape[0], size=config.n_star)
     true_sed_coeff = sed_library.coefficients[true_model_index].copy()
+    n_calibrator = min(config.n_absolute_calibrator, config.n_star)
+    calibrator_ids = np.sort(rng.choice(config.n_star, size=n_calibrator, replace=False))
+    is_calibrator = np.zeros(config.n_star, dtype=bool)
+    is_calibrator[calibrator_ids] = True
 
     true_shift = rng.normal(
         0.0, config.shift_sigma_um, size=(config.n_filter, config.n_det)
@@ -412,6 +417,7 @@ def simulate_data(config: SimConfig) -> None:
         "x": star_x,
         "y": star_y,
         "mag_norm": true_mag_norm,
+        "is_absolute_calibrator": is_calibrator,
         "bosz_model_index": true_model_index,
         "bosz_model_file": sed_library.model_files[true_model_index],
     }
@@ -419,6 +425,7 @@ def simulate_data(config: SimConfig) -> None:
         star_param_payload[f"sed_coeff_{component_id}"] = true_sed_coeff[:, component_id]
     star_params = pd.DataFrame(star_param_payload)
     star_params.to_csv(output_dir / "true_star_params.csv", index=False)
+    star_params.loc[is_calibrator].to_csv(output_dir / "stellar_calibrators.csv", index=False)
 
     pass_rows = []
     for filt in range(config.n_filter):
@@ -525,6 +532,7 @@ def simulate_data(config: SimConfig) -> None:
     metadata["ice_loglam_nodes_file"] = config.ice_loglam_nodes_file
     metadata["n_ice_loglam_nodes"] = int(loglam_nodes.size)
     metadata["n_ice_thickness_nodes"] = int(thickness_nodes.size)
+    metadata["n_absolute_calibrator"] = int(n_calibrator)
     metadata["n_obs"] = len(rows)
     with open(output_dir / "simulation_metadata.json", "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2, sort_keys=True)
@@ -605,6 +613,7 @@ def parse_args() -> SimConfig:
     parser.add_argument("--output-dir", default=SimConfig.output_dir)
     parser.add_argument("--passband-file", default=SimConfig.passband_file)
     parser.add_argument("--sed-basis-path", default=SimConfig.sed_basis_path)
+    parser.add_argument("--n-absolute-calibrator", type=int, default=SimConfig.n_absolute_calibrator)
     parser.add_argument("--ice-loglam-nodes-file", default=SimConfig.ice_loglam_nodes_file)
     parser.add_argument("--n-ice-thickness-nodes", type=int, default=SimConfig.n_ice_thickness_nodes)
     parser.add_argument("--ice-thickness-min", type=float, default=SimConfig.ice_thickness_min)
@@ -614,6 +623,7 @@ def parse_args() -> SimConfig:
         output_dir=args.output_dir,
         passband_file=args.passband_file,
         sed_basis_path=args.sed_basis_path,
+        n_absolute_calibrator=args.n_absolute_calibrator,
         ice_loglam_nodes_file=args.ice_loglam_nodes_file,
         n_ice_thickness_nodes=args.n_ice_thickness_nodes,
         ice_thickness_min=args.ice_thickness_min,

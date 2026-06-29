@@ -245,8 +245,11 @@ Notation:
 - `passband_sim_outputs/true_ice_spline_params.csv`: true ice log-throughput
   values at the spline grid nodes.
 - `passband_sim_outputs/true_star_params.csv`: true star magnitude
-  normalizations, selected BOSZ model IDs/files, and `sed_coeff_*` EMPCA
-  coefficients.
+  normalizations, absolute-calibrator flags, selected BOSZ model IDs/files,
+  and `sed_coeff_*` EMPCA coefficients.
+- `passband_sim_outputs/stellar_calibrators.csv`: fixed absolute calibration
+  stars with known `mag_norm` and `sed_coeff_*` values. These stars are used by
+  the fitter but do not get stellar nuisance-parameter columns.
 - `passband_sim_outputs/true_passband_params.csv`: true detector-level
   passband shift and width coefficients.
 - `passband_fit_outputs/fit_*params.csv`: recovered stellar, passband, and ice
@@ -284,11 +287,12 @@ Useful simulator options:
 /opt/anaconda3/bin/python simulate_roman_passband_data.py --ice-loglam-nodes-file my_nodes.txt
 /opt/anaconda3/bin/python simulate_roman_passband_data.py --ice-thickness-min 0.0 --ice-thickness-max 1.5
 /opt/anaconda3/bin/python simulate_roman_passband_data.py --sed-basis-path bosz_logflux_empca_basis.npz
+/opt/anaconda3/bin/python simulate_roman_passband_data.py --n-absolute-calibrator 50
 ```
 
 The default simulator uses one detector, six supplied Roman passbands, `2,000`
-stars, and `30` exposures. The scripts are structured so the detector axis can
-be expanded later.
+stars, `25` fixed absolute calibrator stars, and `30` exposures. The scripts
+are structured so the detector axis can be expanded later.
 
 ### Stellar SED Basis
 
@@ -318,6 +322,12 @@ parameters. The current basis file in this directory has 4 EMPCA components and
 56 input BOSZ model coefficient vectors. The simulator draws true stars from
 those stored coefficient vectors so the synthetic colors remain on the BOSZ
 training manifold.
+
+A small subset of stars is written to `stellar_calibrators.csv` as absolute
+calibrators. For those stars, `mag_norm` and all `sed_coeff_*` values are
+assumed known exactly by this prototype. The fitter uses their fixed SEDs in
+the forward model and omits their stellar normalization/coefficient update
+columns from the sparse least-squares system.
 
 ### Measurement Table
 
@@ -379,11 +389,13 @@ Column meanings:
 Iteration 0 fits initial stellar SED parameters star-by-star using nominal
 passbands and ignoring passband/ice perturbations. It searches over the BOSZ
 EMPCA coefficient vectors stored in the basis file and solves each star's
-magnitude normalization analytically. Later iterations build a sparse
-linearized system for magnitude residuals and solve updates for:
+magnitude normalization analytically for non-calibrator stars. Absolute
+calibrator stars are initialized from `stellar_calibrators.csv` and held fixed.
+Later iterations build a sparse linearized system for magnitude residuals and
+solve updates for:
 
-- per-star magnitude normalization,
-- per-star BOSZ EMPCA SED coefficients,
+- per-star magnitude normalization for non-calibrator stars,
+- per-star BOSZ EMPCA SED coefficients for non-calibrator stars,
 - per-filter/per-detector passband shift,
 - per-filter/per-detector passband width,
 - global ice log-throughput spline node values.
@@ -435,25 +447,26 @@ log-throughput perturbation.
 
 ### Default Verification
 
-A default run currently produces `55,032` observations and solves `10,057`
-linearized update parameters per iteration. The verified iteration summary is:
+A default run currently produces `55,023` observations, uses `25` fixed
+absolute calibrator stars, and solves `9,932` linearized update parameters per
+iteration. The verified iteration summary is:
 
 ```text
 iteration  RMS residual [mag]
-0          0.022543
-1          0.011789
-2          0.007273
-3          0.005416
-4          0.004784
-5          0.004592
+0          0.015353
+1          0.008467
+2          0.005782
+3          0.004882
+4          0.004624
+5          0.004554
 ```
 
 Final default diagnostics:
 
 ```text
-Passband shift RMS error: 0.001469 um
-Passband width RMS error: 0.012801
-Ice log-throughput surface RMS error: 0.013448
-Stellar EMPCA coefficient RMS error: 0.243813
-Median formal ice-node uncertainty: 0.008151
+Passband shift RMS error: 0.000186 um
+Passband width RMS error: 0.000636
+Ice log-throughput surface RMS error: 0.004771
+Stellar EMPCA coefficient RMS error: 0.069045
+Median formal ice-node uncertainty: 0.005782
 ```

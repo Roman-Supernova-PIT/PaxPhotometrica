@@ -121,6 +121,9 @@ class DataBundle:
     filter_param_id: np.ndarray
     detector_param_id: np.ndarray
     star_param_id: np.ndarray
+    star_is_calibrator: np.ndarray
+    free_star_indices: np.ndarray
+    free_star_index: np.ndarray
     passbands: np.ndarray
     phi_shift: np.ndarray
     phi_width: np.ndarray
@@ -129,6 +132,7 @@ class DataBundle:
     ice_thickness_nodes: np.ndarray
     ice_loglam_basis: np.ndarray
     filter_effective_wavelength: np.ndarray
+    absolute_calibrators: pd.DataFrame | None
     true_star_params: pd.DataFrame | None
     true_passband_params: pd.DataFrame | None
     true_ice_spline_params: pd.DataFrame | None
@@ -320,6 +324,30 @@ def load_data(config: FitConfig) -> DataBundle:
         path = input_dir / name
         return pd.read_csv(path) if path.exists() else None
 
+    absolute_calibrators = read_optional("stellar_calibrators.csv")
+    star_is_calibrator = np.zeros(star_ids.size, dtype=bool)
+    if absolute_calibrators is not None and not absolute_calibrators.empty:
+        required = {"star_id", "mag_norm"}
+        required.update(f"sed_coeff_{i}" for i in range(sed_library.n_components))
+        missing = sorted(required.difference(absolute_calibrators.columns))
+        if missing:
+            raise ValueError(
+                "stellar_calibrators.csv is missing required columns: "
+                + ", ".join(missing)
+            )
+        calibrator_star_ids = set(absolute_calibrators["star_id"].to_numpy(int))
+        star_is_calibrator = np.array(
+            [int(star_id) in calibrator_star_ids for star_id in star_ids],
+            dtype=bool,
+        )
+        absolute_calibrators = absolute_calibrators.loc[
+            absolute_calibrators["star_id"].isin(star_ids)
+        ].copy()
+
+    free_star_indices = np.nonzero(~star_is_calibrator)[0]
+    free_star_index = np.full(star_ids.size, -1, dtype=int)
+    free_star_index[free_star_indices] = np.arange(free_star_indices.size, dtype=int)
+
     return DataBundle(
         measurements=measurements,
         wave=wave,
@@ -330,6 +358,9 @@ def load_data(config: FitConfig) -> DataBundle:
         filter_param_id=filter_param_id,
         detector_param_id=detector_param_id,
         star_param_id=star_param_id,
+        star_is_calibrator=star_is_calibrator,
+        free_star_indices=free_star_indices,
+        free_star_index=free_star_index,
         passbands=passbands,
         phi_shift=phi_shift,
         phi_width=phi_width,
@@ -338,6 +369,7 @@ def load_data(config: FitConfig) -> DataBundle:
         ice_thickness_nodes=ice_thickness_nodes,
         ice_loglam_basis=ice_loglam_basis,
         filter_effective_wavelength=filter_eff,
+        absolute_calibrators=absolute_calibrators,
         true_star_params=read_optional("true_star_params.csv"),
         true_passband_params=read_optional("true_passband_params.csv"),
         true_ice_spline_params=read_optional("true_ice_spline_params.csv"),
@@ -373,7 +405,19 @@ def fit_initial_stellar_seds(data: DataBundle) -> ModelState:
     mag_norm = np.zeros(data.star_ids.size)
     sed_coeff = np.zeros((data.star_ids.size, data.sed_library.n_components))
 
+    if data.absolute_calibrators is not None and not data.absolute_calibrators.empty:
+        coeff_cols = [f"sed_coeff_{i}" for i in range(data.sed_library.n_components)]
+        calibrators = data.absolute_calibrators.set_index("star_id")
+        for star_index, star_id in enumerate(data.star_ids):
+            if not data.star_is_calibrator[star_index]:
+                continue
+            row = calibrators.loc[star_id]
+            mag_norm[star_index] = float(row["mag_norm"])
+            sed_coeff[star_index] = row[coeff_cols].to_numpy(float)
+
     for star_index in range(data.star_ids.size):
+        if data.star_is_calibrator[star_index]:
+            continue
         obs = np.nonzero(data.star_param_id == star_index)[0]
         filt = data.filter_param_id[obs]
         y = mag[obs]
@@ -492,14 +536,14 @@ def evaluate_model_and_responses(
 
 
 def parameter_slices(data: DataBundle) -> dict[str, slice]:
-    n_star = data.star_ids.size
-    n_sed = n_star * data.sed_library.n_components
+    n_free_star = data.free_star_indices.size
+    n_sed = n_free_star * data.sed_library.n_components
     n_pass = data.filter_ids.size * data.detector_ids.size
     n_ice = data.ice_thickness_nodes.size * data.ice_loglam_nodes.size
     start = 0
     slices = {}
-    slices["norm"] = slice(start, start + n_star)
-    start += n_star
+    slices["norm"] = slice(start, start + n_free_star)
+    start += n_free_star
     slices["sed_coeff"] = slice(start, start + n_sed)
     start += n_sed
     slices["shift"] = slice(start, start + n_pass)
@@ -534,20 +578,22 @@ def build_sparse_system(
         filt = data.filter_param_id[obs_index]
         det = data.detector_param_id[obs_index]
         pass_index = filt * n_det + det
+        free_star = data.free_star_index[star]
 
         entries = [
-            (slices["norm"].start + star, lin.d_norm[obs_index]),
             (slices["shift"].start + pass_index, lin.r_shift[obs_index]),
             (slices["width"].start + pass_index, lin.r_width[obs_index]),
         ]
-        for component_id in range(n_components):
-            coeff_index = star * n_components + component_id
-            entries.append(
-                (
-                    slices["sed_coeff"].start + coeff_index,
-                    lin.d_sed_coeff[obs_index, component_id],
+        if free_star >= 0:
+            entries.append((slices["norm"].start + free_star, lin.d_norm[obs_index]))
+            for component_id in range(n_components):
+                coeff_index = free_star * n_components + component_id
+                entries.append(
+                    (
+                        slices["sed_coeff"].start + coeff_index,
+                        lin.d_sed_coeff[obs_index, component_id],
+                    )
                 )
-            )
         for basis_id in range(data.ice_thickness_nodes.size * data.ice_loglam_nodes.size):
             entries.append((slices["ice"].start + basis_id, lin.r_ice[obs_index, basis_id]))
 
@@ -599,9 +645,9 @@ def build_sparse_system(
     coeff_sigma = (
         data.sed_library.coefficient_scales * config.sigma_sed_coeff_update_prior_scale
     )
-    for star in range(data.star_ids.size):
+    for free_star in range(data.free_star_indices.size):
         for component_id, sigma in enumerate(coeff_sigma):
-            coeff_index = star * n_components + component_id
+            coeff_index = free_star * n_components + component_id
             rows.append(row)
             cols.append(slices["sed_coeff"].start + coeff_index)
             vals.append(1.0 / sigma)
@@ -615,18 +661,19 @@ def build_sparse_system(
 def apply_update(
     state: ModelState, theta: np.ndarray, slices: dict[str, slice], data: DataBundle, config: FitConfig
 ) -> None:
-    n_star = data.star_ids.size
     n_components = data.sed_library.n_components
     n_filter = data.filter_ids.size
     n_det = data.detector_ids.size
     damping = config.damping
 
-    state.mag_norm += damping * theta[slices["norm"]]
-    state.sed_coeff += damping * theta[slices["sed_coeff"]].reshape(n_star, n_components)
+    free = data.free_star_indices
+    state.mag_norm[free] += damping * theta[slices["norm"]]
+    state.sed_coeff[free] += damping * theta[slices["sed_coeff"]].reshape(
+        free.size, n_components
+    )
     state.shift += damping * theta[slices["shift"]].reshape(n_filter, n_det)
     state.width += damping * theta[slices["width"]].reshape(n_filter, n_det)
     state.ice_coeff += damping * theta[slices["ice"]]
-    _ = n_star
 
 
 def rms(values: np.ndarray) -> float:
@@ -790,17 +837,22 @@ def save_outputs(
 
     star_payload = {
         "star_id": data.star_ids,
+        "is_absolute_calibrator": data.star_is_calibrator,
         "mag_norm": state.mag_norm,
     }
     if param_sigma is not None and slices is not None:
-        star_payload["mag_norm_sigma"] = param_sigma[slices["norm"]]
+        mag_norm_sigma = np.zeros(data.star_ids.size)
+        mag_norm_sigma[data.free_star_indices] = param_sigma[slices["norm"]]
+        star_payload["mag_norm_sigma"] = mag_norm_sigma
     for component_id in range(data.sed_library.n_components):
         star_payload[f"sed_coeff_{component_id}"] = state.sed_coeff[:, component_id]
         if param_sigma is not None and slices is not None:
             sigma_start = slices["sed_coeff"].start + component_id
-            star_payload[f"sed_coeff_{component_id}_sigma"] = param_sigma[
+            coeff_sigma = np.zeros(data.star_ids.size)
+            coeff_sigma[data.free_star_indices] = param_sigma[
                 sigma_start : slices["sed_coeff"].stop : data.sed_library.n_components
             ]
+            star_payload[f"sed_coeff_{component_id}_sigma"] = coeff_sigma
     pd.DataFrame(star_payload).to_csv(output_dir / "fit_star_params.csv", index=False)
 
     pass_rows = []
@@ -873,10 +925,12 @@ def print_diagnostics(
     print("-------------------------------------------")
     print(f"Number of observations: {len(data.measurements)}")
     print(f"Number of stars: {data.star_ids.size}")
+    print(f"Number of fixed absolute calibrator stars: {int(data.star_is_calibrator.sum())}")
+    print(f"Number of fitted stars: {data.free_star_indices.size}")
     print(f"Number of filters: {data.filter_ids.size}")
     print(f"Number of detectors: {data.detector_ids.size}")
     print(f"Number of BOSZ EMPCA SED components: {data.sed_library.n_components}")
-    n_params = (1 + data.sed_library.n_components) * data.star_ids.size
+    n_params = (1 + data.sed_library.n_components) * data.free_star_indices.size
     n_params += 2 * data.filter_ids.size * data.detector_ids.size
     n_params += data.ice_thickness_nodes.size * data.ice_loglam_nodes.size
     print(f"Number of fitted linearized parameters per iteration: {n_params}")
@@ -1104,12 +1158,23 @@ def make_plots(
                 figsize=(3.5 * n_cols, 7.0),
                 squeeze=False,
             )
+            free_mask = ~data.star_is_calibrator
+            calib_mask = data.star_is_calibrator
             for col_index, (label, true_values, fit_values) in enumerate(parameters):
                 recovery_ax = axes[0, col_index]
                 residual_ax = axes[1, col_index]
                 residual = fit_values - true_values
 
-                recovery_ax.scatter(true_values, fit_values, s=5, alpha=0.35)
+                recovery_ax.scatter(true_values[free_mask], fit_values[free_mask], s=5, alpha=0.35)
+                if np.any(calib_mask):
+                    recovery_ax.scatter(
+                        true_values[calib_mask],
+                        fit_values[calib_mask],
+                        s=24,
+                        facecolors="none",
+                        edgecolors="crimson",
+                        linewidths=0.8,
+                    )
                 vmin = min(true_values.min(), fit_values.min())
                 vmax = max(true_values.max(), fit_values.max())
                 recovery_ax.plot([vmin, vmax], [vmin, vmax], color="0.2", linewidth=1)
@@ -1117,7 +1182,16 @@ def make_plots(
                 recovery_ax.set_xlabel(f"True {label}")
                 recovery_ax.set_ylabel(f"Fitted {label}")
 
-                residual_ax.scatter(true_values, residual, s=5, alpha=0.35)
+                residual_ax.scatter(true_values[free_mask], residual[free_mask], s=5, alpha=0.35)
+                if np.any(calib_mask):
+                    residual_ax.scatter(
+                        true_values[calib_mask],
+                        residual[calib_mask],
+                        s=24,
+                        facecolors="none",
+                        edgecolors="crimson",
+                        linewidths=0.8,
+                    )
                 residual_ax.axhline(0.0, color="0.2", linewidth=1)
                 residual_ax.set_xlabel(f"True {label}")
                 residual_ax.set_ylabel("Fit - true")
