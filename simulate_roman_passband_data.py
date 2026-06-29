@@ -40,7 +40,7 @@ class SimConfig:
     nx: int = 4096
     ny: int = 4096
     n_filter: int = 6
-    n_absolute_calibrator: int = 25
+    n_absolute_calibrator: int = 5
     wave_min: float = 0.45
     wave_max: float = 2.30
     n_wave: int = 2000
