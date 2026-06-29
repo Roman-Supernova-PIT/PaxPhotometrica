@@ -44,6 +44,7 @@ class SimConfig:
     wave_max: float = 2.30
     n_wave: int = 2000
     passband_file: str = "passbands.txt"
+    sed_basis_path: str = "bosz_logflux_empca_basis.npz"
     ice_loglam_nodes_file: str = "ice_loglam_nodes.txt"
     n_ice_thickness_nodes: int = 5
     ice_thickness_min: float = 0.0
@@ -56,6 +57,61 @@ class SimConfig:
     mode_smooth_sigma_pix: float = 4.0
     max_abs_phi_shift: float = 250.0
     max_abs_phi_width: float = 80.0
+
+
+class BOSZEMPCASEDLibrary:
+    """Low-dimensional BOSZ EMPCA stellar SED library.
+
+    The basis stores normalized log flux. The simulator draws one of the input
+    BOSZ coefficient vectors for each star and assigns a separate magnitude
+    normalization, so photometry uses realistic relative colors without
+    pretending the BOSZ absolute flux scale survived the EMPCA normalization.
+    """
+
+    def __init__(self, basis_path: str | Path):
+        self.path = Path(basis_path)
+        if not self.path.exists():
+            raise FileNotFoundError(f"Missing BOSZ EMPCA basis file: {self.path}")
+        data = np.load(self.path, allow_pickle=False)
+        self.wave_micron = data["wave_micron"].astype(float)
+        self.source_wave_micron = self.wave_micron
+        self.mean_log_flux = data["mean_log_flux"].astype(float)
+        self.components = data["components"].astype(float)
+        self.coefficients = data["coefficients"].astype(float)
+        self.model_files = data["model_files"].astype(str)
+        self.metadata = json.loads(data["metadata"].item()) if "metadata" in data.files else {}
+
+    @property
+    def n_components(self) -> int:
+        return int(self.components.shape[0])
+
+    def resampled_to(self, wave: np.ndarray) -> "BOSZEMPCASEDLibrary":
+        """Return a lightweight copy with log-flux basis interpolated to ``wave``."""
+        if wave.min() < self.wave_micron.min() or wave.max() > self.wave_micron.max():
+            print(
+                "Warning: passband wavelength grid extends slightly outside the BOSZ "
+                "basis; endpoint log-flux values will be used for extrapolation."
+            )
+        clone = object.__new__(BOSZEMPCASEDLibrary)
+        clone.path = self.path
+        clone.wave_micron = np.asarray(wave, dtype=float)
+        clone.source_wave_micron = self.source_wave_micron
+        clone.mean_log_flux = np.interp(wave, self.wave_micron, self.mean_log_flux)
+        clone.components = np.vstack(
+            [np.interp(wave, self.wave_micron, component) for component in self.components]
+        )
+        clone.coefficients = self.coefficients
+        clone.model_files = self.model_files
+        clone.metadata = self.metadata
+        return clone
+
+    def sed_from_coefficients(self, theta: np.ndarray, mag_norm: np.ndarray) -> np.ndarray:
+        """Evaluate relative SEDs for one or many EMPCA coefficient vectors."""
+        theta = np.asarray(theta, dtype=float)
+        mag_norm = np.asarray(mag_norm, dtype=float)
+        log_sed = self.mean_log_flux + theta @ self.components
+        scale = 10.0 ** (-0.4 * mag_norm)
+        return scale[..., None] * np.exp(log_sed)
 
 
 def trapz_integral(y: np.ndarray, wave: np.ndarray, axis: int = -1) -> np.ndarray:
@@ -240,43 +296,6 @@ def interpolate_ice_surface(
     return w_lo * surface_lo + w_hi * surface_hi
 
 
-def extinction_curve(wave: np.ndarray) -> np.ndarray:
-    """Simple decreasing extinction law in arbitrary optical-depth units."""
-    return (wave / 1.0) ** (-1.2)
-
-
-def planck_like_lambda(wave_um: np.ndarray, temperature_k: np.ndarray) -> np.ndarray:
-    """A stable Planck-like SED family in arbitrary units.
-
-    The result is normalized near 1 micron so the stellar normalization parameter
-    controls the overall magnitude scale.
-    """
-    wave = np.asarray(wave_um)
-    temp = np.asarray(temperature_k)
-    c2_um_k = 14387.76877
-    x = c2_um_k / (temp[..., None] * wave[None, :])
-    x = np.clip(x, 1e-3, 700.0)
-    b_lambda = 1.0 / (wave[None, :] ** 5 * np.expm1(x))
-
-    ref_wave = 1.0
-    x_ref = np.clip(c2_um_k / (temp * ref_wave), 1e-3, 700.0)
-    b_ref = 1.0 / (ref_wave**5 * np.expm1(x_ref))
-    return b_lambda / b_ref[..., None]
-
-
-def stellar_sed(
-    wave: np.ndarray, mag_norm: np.ndarray, temperature: np.ndarray, extinction: np.ndarray
-) -> np.ndarray:
-    """Return flux-density SEDs for one or many stars."""
-    mag_norm = np.asarray(mag_norm)
-    temperature = np.asarray(temperature)
-    extinction = np.asarray(extinction)
-    scale = 10.0 ** (-0.4 * mag_norm)
-    shape = planck_like_lambda(wave, temperature)
-    extinct = np.exp(-extinction[..., None] * extinction_curve(wave)[None, :])
-    return scale[..., None] * shape * extinct
-
-
 def flux_to_mag(flux: np.ndarray) -> np.ndarray:
     return -2.5 * np.log10(np.maximum(flux, 1e-300))
 
@@ -360,6 +379,7 @@ def simulate_data(config: SimConfig) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     wave, passbands, filter_centers, filter_names = read_nominal_passbands(config)
+    sed_library = BOSZEMPCASEDLibrary(config.sed_basis_path).resampled_to(wave)
     phi_shift, phi_width = make_passband_modes(wave, passbands, filter_centers, config)
     loglam_nodes = read_ice_loglam_nodes(config, wave)
     thickness_nodes = make_ice_thickness_nodes(config)
@@ -378,25 +398,26 @@ def simulate_data(config: SimConfig) -> None:
     star_y = rng.uniform(0.0, config.ny, size=config.n_star)
 
     true_mag_norm = rng.uniform(18.0, 22.0, size=config.n_star)
-    true_temperature = rng.uniform(3600.0, 8500.0, size=config.n_star)
-    true_extinction = rng.uniform(0.0, 0.35, size=config.n_star)
+    true_model_index = rng.integers(sed_library.coefficients.shape[0], size=config.n_star)
+    true_sed_coeff = sed_library.coefficients[true_model_index].copy()
 
     true_shift = rng.normal(
         0.0, config.shift_sigma_um, size=(config.n_filter, config.n_det)
     )
     true_width = rng.normal(0.0, config.width_sigma, size=(config.n_filter, config.n_det))
 
-    star_params = pd.DataFrame(
-        {
-            "star_id": np.arange(config.n_star, dtype=int),
-            "detector_id": star_detector_id,
-            "x": star_x,
-            "y": star_y,
-            "mag_norm": true_mag_norm,
-            "temperature_k": true_temperature,
-            "extinction": true_extinction,
-        }
-    )
+    star_param_payload = {
+        "star_id": np.arange(config.n_star, dtype=int),
+        "detector_id": star_detector_id,
+        "x": star_x,
+        "y": star_y,
+        "mag_norm": true_mag_norm,
+        "bosz_model_index": true_model_index,
+        "bosz_model_file": sed_library.model_files[true_model_index],
+    }
+    for component_id in range(sed_library.n_components):
+        star_param_payload[f"sed_coeff_{component_id}"] = true_sed_coeff[:, component_id]
+    star_params = pd.DataFrame(star_param_payload)
     star_params.to_csv(output_dir / "true_star_params.csv", index=False)
 
     pass_rows = []
@@ -421,7 +442,7 @@ def simulate_data(config: SimConfig) -> None:
     exposure_ice = 0.55 + 0.35 * np.sin(slow_phase) + rng.normal(0.0, 0.07, config.n_exp)
     exposure_ice = np.clip(exposure_ice, 0.02, 1.20)
 
-    sed_all = stellar_sed(wave, true_mag_norm, true_temperature, true_extinction)
+    sed_all = sed_library.sed_from_coefficients(true_sed_coeff, true_mag_norm)
 
     rows = []
     obs_id = 0
@@ -493,6 +514,11 @@ def simulate_data(config: SimConfig) -> None:
     metadata["wave_min"] = float(wave.min())
     metadata["wave_max"] = float(wave.max())
     metadata["n_wave"] = int(wave.size)
+    metadata["sed_basis_path"] = str(Path(config.sed_basis_path))
+    metadata["sed_basis_n_components"] = sed_library.n_components
+    metadata["sed_basis_n_models"] = int(sed_library.coefficients.shape[0])
+    metadata["sed_basis_wave_min"] = float(sed_library.source_wave_micron.min())
+    metadata["sed_basis_wave_max"] = float(sed_library.source_wave_micron.max())
     metadata["detector_ids"] = detector_ids.tolist()
     metadata["filter_names"] = filter_names
     metadata["filter_centers_um"] = filter_centers.tolist()
@@ -578,6 +604,7 @@ def parse_args() -> SimConfig:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", default=SimConfig.output_dir)
     parser.add_argument("--passband-file", default=SimConfig.passband_file)
+    parser.add_argument("--sed-basis-path", default=SimConfig.sed_basis_path)
     parser.add_argument("--ice-loglam-nodes-file", default=SimConfig.ice_loglam_nodes_file)
     parser.add_argument("--n-ice-thickness-nodes", type=int, default=SimConfig.n_ice_thickness_nodes)
     parser.add_argument("--ice-thickness-min", type=float, default=SimConfig.ice_thickness_min)
@@ -586,6 +613,7 @@ def parse_args() -> SimConfig:
     return SimConfig(
         output_dir=args.output_dir,
         passband_file=args.passband_file,
+        sed_basis_path=args.sed_basis_path,
         ice_loglam_nodes_file=args.ice_loglam_nodes_file,
         n_ice_thickness_nodes=args.n_ice_thickness_nodes,
         ice_thickness_min=args.ice_thickness_min,

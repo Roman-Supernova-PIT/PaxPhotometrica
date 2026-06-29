@@ -39,10 +39,65 @@ from scipy.sparse.linalg import lsmr, lsqr
 MAG_FACTOR = 2.5 / np.log(10.0)
 
 
+class BOSZEMPCASEDLibrary:
+    """BOSZ EMPCA stellar SED basis evaluated in normalized log-flux space."""
+
+    def __init__(self, basis_path: str | Path):
+        self.path = Path(basis_path)
+        if not self.path.exists():
+            raise FileNotFoundError(f"Missing BOSZ EMPCA basis file: {self.path}")
+        data = np.load(self.path, allow_pickle=False)
+        self.wave_micron = data["wave_micron"].astype(float)
+        self.source_wave_micron = self.wave_micron
+        self.mean_log_flux = data["mean_log_flux"].astype(float)
+        self.components = data["components"].astype(float)
+        self.coefficients = data["coefficients"].astype(float)
+        self.model_files = data["model_files"].astype(str)
+        self.metadata = json.loads(data["metadata"].item()) if "metadata" in data.files else {}
+
+    @property
+    def n_components(self) -> int:
+        return int(self.components.shape[0])
+
+    @property
+    def coefficient_scales(self) -> np.ndarray:
+        scales = np.std(self.coefficients, axis=0)
+        return np.maximum(scales, 1e-3)
+
+    def resampled_to(self, wave: np.ndarray) -> "BOSZEMPCASEDLibrary":
+        """Interpolate normalized log-flux basis vectors to the passband grid."""
+        if wave.min() < self.wave_micron.min() or wave.max() > self.wave_micron.max():
+            print(
+                "Warning: passband wavelength grid extends slightly outside the BOSZ "
+                "basis; endpoint log-flux values will be used for extrapolation."
+            )
+        clone = object.__new__(BOSZEMPCASEDLibrary)
+        clone.path = self.path
+        clone.wave_micron = np.asarray(wave, dtype=float)
+        clone.source_wave_micron = self.source_wave_micron
+        clone.mean_log_flux = np.interp(wave, self.wave_micron, self.mean_log_flux)
+        clone.components = np.vstack(
+            [np.interp(wave, self.wave_micron, component) for component in self.components]
+        )
+        clone.coefficients = self.coefficients
+        clone.model_files = self.model_files
+        clone.metadata = self.metadata
+        return clone
+
+    def sed_from_coefficients(self, theta: np.ndarray, mag_norm: np.ndarray) -> np.ndarray:
+        """Evaluate relative SEDs for one or many EMPCA coefficient vectors."""
+        theta = np.asarray(theta, dtype=float)
+        mag_norm = np.asarray(mag_norm, dtype=float)
+        log_sed = self.mean_log_flux + theta @ self.components
+        scale = 10.0 ** (-0.4 * np.asarray(mag_norm, dtype=float))
+        return scale[..., None] * np.exp(log_sed)
+
+
 @dataclass
 class FitConfig:
     input_dir: str = "passband_sim_outputs"
     output_dir: str = "passband_fit_outputs"
+    sed_basis_path: str = ""
     n_iter: int = 5
     damping: float = 0.5
     max_stars: int | None = None
@@ -50,14 +105,7 @@ class FitConfig:
     sigma_width_prior: float = 0.05
     sigma_ice_prior: float = 0.10
     sigma_zero_ice_surface_prior: float = 1e-4
-    sigma_temp_update_prior: float = 400.0
-    sigma_ext_update_prior: float = 0.05
-    temp_fd_step: float = 20.0
-    ext_fd_step: float = 0.002
-    min_temperature: float = 2800.0
-    max_temperature: float = 12000.0
-    min_extinction: float = 0.0
-    max_extinction: float = 1.0
+    sigma_sed_coeff_update_prior_scale: float = 0.25
     chunk_size: int = 512
     random_seed: int = 12345
 
@@ -76,6 +124,7 @@ class DataBundle:
     passbands: np.ndarray
     phi_shift: np.ndarray
     phi_width: np.ndarray
+    sed_library: BOSZEMPCASEDLibrary
     ice_loglam_nodes: np.ndarray
     ice_thickness_nodes: np.ndarray
     ice_loglam_basis: np.ndarray
@@ -89,8 +138,7 @@ class DataBundle:
 @dataclass
 class ModelState:
     mag_norm: np.ndarray
-    temperature: np.ndarray
-    extinction: np.ndarray
+    sed_coeff: np.ndarray
     shift: np.ndarray
     width: np.ndarray
     ice_coeff: np.ndarray
@@ -100,8 +148,7 @@ class ModelState:
 class Linearization:
     mag_model: np.ndarray
     d_norm: np.ndarray
-    d_temp: np.ndarray
-    d_ext: np.ndarray
+    d_sed_coeff: np.ndarray
     r_shift: np.ndarray
     r_width: np.ndarray
     r_ice: np.ndarray
@@ -112,32 +159,6 @@ def trapz_integral(y: np.ndarray, wave: np.ndarray, axis: int = -1) -> np.ndarra
     if hasattr(np, "trapezoid"):
         return np.trapezoid(y, wave, axis=axis)
     return np.trapz(y, wave, axis=axis)
-
-
-def extinction_curve(wave: np.ndarray) -> np.ndarray:
-    return (wave / 1.0) ** (-1.2)
-
-
-def planck_like_lambda(wave_um: np.ndarray, temperature_k: np.ndarray) -> np.ndarray:
-    """Same Planck-like SED family used by the simulator."""
-    wave = np.asarray(wave_um)
-    temp = np.asarray(temperature_k)
-    c2_um_k = 14387.76877
-    x = c2_um_k / (temp[..., None] * wave[None, :])
-    x = np.clip(x, 1e-3, 700.0)
-    b_lambda = 1.0 / (wave[None, :] ** 5 * np.expm1(x))
-    x_ref = np.clip(c2_um_k / (temp * 1.0), 1e-3, 700.0)
-    b_ref = 1.0 / np.expm1(x_ref)
-    return b_lambda / b_ref[..., None]
-
-
-def stellar_sed(
-    wave: np.ndarray, mag_norm: np.ndarray, temperature: np.ndarray, extinction: np.ndarray
-) -> np.ndarray:
-    scale = 10.0 ** (-0.4 * np.asarray(mag_norm))
-    shape = planck_like_lambda(wave, np.asarray(temperature))
-    extinct = np.exp(-np.asarray(extinction)[..., None] * extinction_curve(wave)[None, :])
-    return scale[..., None] * shape * extinct
 
 
 def flux_to_mag(flux: np.ndarray) -> np.ndarray:
@@ -214,6 +235,25 @@ def evaluate_ice_surface_chunk(
     return w_lo[:, None] * surface_lo + w_hi[:, None] * surface_hi
 
 
+def resolve_sed_basis_path(config: FitConfig, sim_metadata: dict, input_dir: Path) -> Path:
+    """Find the BOSZ EMPCA basis, honoring CLI, metadata, and local defaults."""
+    candidates = []
+    if config.sed_basis_path:
+        candidates.append(Path(config.sed_basis_path))
+    metadata_path = sim_metadata.get("sed_basis_path")
+    if metadata_path:
+        candidates.extend([Path(metadata_path), input_dir / metadata_path])
+    candidates.append(Path("bosz_logflux_empca_basis.npz"))
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        "Could not find BOSZ EMPCA basis. Pass --sed-basis-path or keep "
+        "bosz_logflux_empca_basis.npz in the working directory."
+    )
+
+
 def load_data(config: FitConfig) -> DataBundle:
     input_dir = Path(config.input_dir)
     measurements = pd.read_csv(input_dir / "measurements.csv")
@@ -230,6 +270,16 @@ def load_data(config: FitConfig) -> DataBundle:
     )
     if not np.allclose(wave, wave_modes):
         raise ValueError("Passband and mode wavelength grids do not match")
+
+    metadata_path = input_dir / "simulation_metadata.json"
+    sim_metadata = {}
+    if metadata_path.exists():
+        with open(metadata_path, "r", encoding="utf-8") as handle:
+            sim_metadata = json.load(handle)
+    sed_basis_path = resolve_sed_basis_path(config, sim_metadata, input_dir)
+    config.sed_basis_path = str(sed_basis_path)
+    sed_library = BOSZEMPCASEDLibrary(sed_basis_path).resampled_to(wave)
+
     ice_loglam_nodes, ice_thickness_nodes = load_ice_spline_nodes(
         input_dir / "ice_spline_nodes.csv"
     )
@@ -270,12 +320,6 @@ def load_data(config: FitConfig) -> DataBundle:
         path = input_dir / name
         return pd.read_csv(path) if path.exists() else None
 
-    metadata_path = input_dir / "simulation_metadata.json"
-    sim_metadata = {}
-    if metadata_path.exists():
-        with open(metadata_path, "r", encoding="utf-8") as handle:
-            sim_metadata = json.load(handle)
-
     return DataBundle(
         measurements=measurements,
         wave=wave,
@@ -289,6 +333,7 @@ def load_data(config: FitConfig) -> DataBundle:
         passbands=passbands,
         phi_shift=phi_shift,
         phi_width=phi_width,
+        sed_library=sed_library,
         ice_loglam_nodes=ice_loglam_nodes,
         ice_thickness_nodes=ice_thickness_nodes,
         ice_loglam_basis=ice_loglam_basis,
@@ -300,36 +345,33 @@ def load_data(config: FitConfig) -> DataBundle:
     )
 
 
-def make_initial_sed_grid(data: DataBundle) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Precompute nominal-passband colors for a temperature/extinction grid."""
-    temps = np.linspace(3200.0, 9500.0, 31)
-    exts = np.linspace(0.0, 0.45, 19)
-    grid_temp, grid_ext = np.meshgrid(temps, exts, indexing="ij")
-    flat_temp = grid_temp.ravel()
-    flat_ext = grid_ext.ravel()
-    sed_shape = stellar_sed(data.wave, np.zeros_like(flat_temp), flat_temp, flat_ext)
+def make_initial_sed_grid(data: DataBundle) -> tuple[np.ndarray, np.ndarray]:
+    """Precompute nominal-passband colors for each BOSZ EMPCA template."""
+    grid_coeff = data.sed_library.coefficients
+    sed_shape = data.sed_library.sed_from_coefficients(
+        grid_coeff, np.zeros(grid_coeff.shape[0])
+    )
 
-    shape_mag = np.zeros((flat_temp.size, data.filter_ids.size))
+    shape_mag = np.zeros((grid_coeff.shape[0], data.filter_ids.size))
     for filt in range(data.filter_ids.size):
         flux = trapz_integral(sed_shape * data.passbands[filt][None, :], data.wave, axis=1)
         shape_mag[:, filt] = flux_to_mag(flux)
-    return flat_temp, flat_ext, shape_mag
+    return grid_coeff, shape_mag
 
 
 def fit_initial_stellar_seds(data: DataBundle) -> ModelState:
-    """Initial star-by-star grid search with nominal passbands and no ice.
+    """Initial star-by-star BOSZ template search with nominal passbands and no ice.
 
-    For each grid point in temperature/extinction, the magnitude normalization is
-    analytic: it is the weighted mean of observed magnitude minus model color.
+    For each BOSZ template coefficient vector, the magnitude normalization is
+    analytic: it is the weighted mean of observed magnitude minus template color.
     """
-    grid_temp, grid_ext, shape_mag = make_initial_sed_grid(data)
+    grid_coeff, shape_mag = make_initial_sed_grid(data)
     mag = data.measurements["mag_obs"].to_numpy(float)
     sigma = data.measurements["mag_unc"].to_numpy(float)
     weight = 1.0 / sigma**2
 
     mag_norm = np.zeros(data.star_ids.size)
-    temperature = np.zeros(data.star_ids.size)
-    extinction = np.zeros(data.star_ids.size)
+    sed_coeff = np.zeros((data.star_ids.size, data.sed_library.n_components))
 
     for star_index in range(data.star_ids.size):
         obs = np.nonzero(data.star_param_id == star_index)[0]
@@ -342,13 +384,12 @@ def fit_initial_stellar_seds(data: DataBundle) -> ModelState:
         chi2 = np.sum(w[None, :] * resid**2, axis=1)
         best = int(np.argmin(chi2))
         mag_norm[star_index] = norm_grid[best]
-        temperature[star_index] = grid_temp[best]
-        extinction[star_index] = grid_ext[best]
+        sed_coeff[star_index] = grid_coeff[best]
 
     shift = np.zeros((data.filter_ids.size, data.detector_ids.size))
     width = np.zeros_like(shift)
     ice_coeff = np.zeros(data.ice_thickness_nodes.size * data.ice_loglam_nodes.size)
-    return ModelState(mag_norm, temperature, extinction, shift, width, ice_coeff)
+    return ModelState(mag_norm, sed_coeff, shift, width, ice_coeff)
 
 
 def evaluate_model_and_responses(
@@ -361,10 +402,10 @@ def evaluate_model_and_responses(
     """
     n_obs = len(data.measurements)
     n_ice = data.ice_thickness_nodes.size * data.ice_loglam_nodes.size
+    n_sed_coeff = data.sed_library.n_components
     mag_model = np.zeros(n_obs)
     d_norm = np.ones(n_obs)
-    d_temp = np.zeros(n_obs)
-    d_ext = np.zeros(n_obs)
+    d_sed_coeff = np.zeros((n_obs, n_sed_coeff))
     r_shift = np.zeros(n_obs)
     r_width = np.zeros(n_obs)
     r_ice = np.zeros((n_obs, n_ice))
@@ -382,11 +423,9 @@ def evaluate_model_and_responses(
         det = data.detector_param_id[sl]
         ice = ice_thickness[sl]
 
-        sed = stellar_sed(
-            data.wave,
+        sed = data.sed_library.sed_from_coefficients(
+            state.sed_coeff[star],
             state.mag_norm[star],
-            state.temperature[star],
-            state.extinction[star],
         )
         logt = (
             state.shift[filt, det][:, None] * data.phi_shift[filt]
@@ -406,45 +445,19 @@ def evaluate_model_and_responses(
         if not need_responses:
             continue
 
-        temp_step = config.temp_fd_step
-        temp_plus = np.clip(
-            state.temperature[star] + temp_step,
-            config.min_temperature,
-            config.max_temperature,
-        )
-        temp_minus = np.clip(
-            state.temperature[star] - temp_step,
-            config.min_temperature,
-            config.max_temperature,
-        )
-        sed_t_plus = stellar_sed(data.wave, state.mag_norm[star], temp_plus, state.extinction[star])
-        sed_t_minus = stellar_sed(
-            data.wave, state.mag_norm[star], temp_minus, state.extinction[star]
-        )
-        mag_t_plus = flux_to_mag(trapz_integral(sed_t_plus * t_current, data.wave, axis=1))
-        mag_t_minus = flux_to_mag(trapz_integral(sed_t_minus * t_current, data.wave, axis=1))
-        d_temp[sl] = (mag_t_plus - mag_t_minus) / np.maximum(temp_plus - temp_minus, 1e-6)
-
-        ext_step = config.ext_fd_step
-        ext_plus = np.clip(
-            state.extinction[star] + ext_step,
-            config.min_extinction,
-            config.max_extinction,
-        )
-        ext_minus = np.clip(
-            state.extinction[star] - ext_step,
-            config.min_extinction,
-            config.max_extinction,
-        )
-        sed_e_plus = stellar_sed(
-            data.wave, state.mag_norm[star], state.temperature[star], ext_plus
-        )
-        sed_e_minus = stellar_sed(
-            data.wave, state.mag_norm[star], state.temperature[star], ext_minus
-        )
-        mag_e_plus = flux_to_mag(trapz_integral(sed_e_plus * t_current, data.wave, axis=1))
-        mag_e_minus = flux_to_mag(trapz_integral(sed_e_minus * t_current, data.wave, axis=1))
-        d_ext[sl] = (mag_e_plus - mag_e_minus) / np.maximum(ext_plus - ext_minus, 1e-9)
+        # The BOSZ EMPCA coefficients perturb normalized log flux:
+        # log f_s(lambda) = mean_log_flux + theta @ components + log amplitude.
+        # Therefore d mag / d theta_c uses the same flux-weighted integral form
+        # as the log-throughput response modes.
+        for component_id in range(n_sed_coeff):
+            d_sed_coeff[sl, component_id] = -MAG_FACTOR * (
+                trapz_integral(
+                    weighted * data.sed_library.components[component_id][None, :],
+                    data.wave,
+                    axis=1,
+                )
+                / denom
+            )
 
         r_shift[sl] = -MAG_FACTOR * (
             trapz_integral(weighted * data.phi_shift[filt], data.wave, axis=1) / denom
@@ -475,21 +488,20 @@ def evaluate_model_and_responses(
                     / denom[local_row]
                 )
 
-    return Linearization(mag_model, d_norm, d_temp, d_ext, r_shift, r_width, r_ice)
+    return Linearization(mag_model, d_norm, d_sed_coeff, r_shift, r_width, r_ice)
 
 
 def parameter_slices(data: DataBundle) -> dict[str, slice]:
     n_star = data.star_ids.size
+    n_sed = n_star * data.sed_library.n_components
     n_pass = data.filter_ids.size * data.detector_ids.size
     n_ice = data.ice_thickness_nodes.size * data.ice_loglam_nodes.size
     start = 0
     slices = {}
     slices["norm"] = slice(start, start + n_star)
     start += n_star
-    slices["temp"] = slice(start, start + n_star)
-    start += n_star
-    slices["ext"] = slice(start, start + n_star)
-    start += n_star
+    slices["sed_coeff"] = slice(start, start + n_sed)
+    start += n_sed
     slices["shift"] = slice(start, start + n_pass)
     start += n_pass
     slices["width"] = slice(start, start + n_pass)
@@ -504,6 +516,7 @@ def build_sparse_system(
     """Build weighted sparse system for one linearized update."""
     slices = parameter_slices(data)
     n_params = slices["ice"].stop
+    n_components = data.sed_library.n_components
     rows = []
     cols = []
     vals = []
@@ -524,11 +537,17 @@ def build_sparse_system(
 
         entries = [
             (slices["norm"].start + star, lin.d_norm[obs_index]),
-            (slices["temp"].start + star, lin.d_temp[obs_index]),
-            (slices["ext"].start + star, lin.d_ext[obs_index]),
             (slices["shift"].start + pass_index, lin.r_shift[obs_index]),
             (slices["width"].start + pass_index, lin.r_width[obs_index]),
         ]
+        for component_id in range(n_components):
+            coeff_index = star * n_components + component_id
+            entries.append(
+                (
+                    slices["sed_coeff"].start + coeff_index,
+                    lin.d_sed_coeff[obs_index, component_id],
+                )
+            )
         for basis_id in range(data.ice_thickness_nodes.size * data.ice_loglam_nodes.size):
             entries.append((slices["ice"].start + basis_id, lin.r_ice[obs_index, basis_id]))
 
@@ -574,20 +593,20 @@ def build_sparse_system(
         rhs.append(-current / config.sigma_zero_ice_surface_prior)
         row += 1
 
-    # SED color/extinction update priors prevent each star from freely absorbing
-    # global passband and ice structure in every iteration.
+    # SED coefficient update priors prevent each star from freely absorbing
+    # global passband and ice structure in every iteration. The prior scale is
+    # based on the empirical BOSZ coefficient scatter for each EMPCA component.
+    coeff_sigma = (
+        data.sed_library.coefficient_scales * config.sigma_sed_coeff_update_prior_scale
+    )
     for star in range(data.star_ids.size):
-        rows.append(row)
-        cols.append(slices["temp"].start + star)
-        vals.append(1.0 / config.sigma_temp_update_prior)
-        rhs.append(0.0)
-        row += 1
-
-        rows.append(row)
-        cols.append(slices["ext"].start + star)
-        vals.append(1.0 / config.sigma_ext_update_prior)
-        rhs.append(0.0)
-        row += 1
+        for component_id, sigma in enumerate(coeff_sigma):
+            coeff_index = star * n_components + component_id
+            rows.append(row)
+            cols.append(slices["sed_coeff"].start + coeff_index)
+            vals.append(1.0 / sigma)
+            rhs.append(0.0)
+            row += 1
 
     A = coo_matrix((vals, (rows, cols)), shape=(row, n_params)).tocsr()
     return A, np.asarray(rhs), slices
@@ -597,15 +616,13 @@ def apply_update(
     state: ModelState, theta: np.ndarray, slices: dict[str, slice], data: DataBundle, config: FitConfig
 ) -> None:
     n_star = data.star_ids.size
+    n_components = data.sed_library.n_components
     n_filter = data.filter_ids.size
     n_det = data.detector_ids.size
     damping = config.damping
 
     state.mag_norm += damping * theta[slices["norm"]]
-    state.temperature += damping * theta[slices["temp"]]
-    state.extinction += damping * theta[slices["ext"]]
-    state.temperature = np.clip(state.temperature, config.min_temperature, config.max_temperature)
-    state.extinction = np.clip(state.extinction, config.min_extinction, config.max_extinction)
+    state.sed_coeff += damping * theta[slices["sed_coeff"]].reshape(n_star, n_components)
     state.shift += damping * theta[slices["shift"]].reshape(n_filter, n_det)
     state.width += damping * theta[slices["width"]].reshape(n_filter, n_det)
     state.ice_coeff += damping * theta[slices["ice"]]
@@ -771,14 +788,20 @@ def save_outputs(
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    pd.DataFrame(
-        {
-            "star_id": data.star_ids,
-            "mag_norm": state.mag_norm,
-            "temperature_k": state.temperature,
-            "extinction": state.extinction,
-        }
-    ).to_csv(output_dir / "fit_star_params.csv", index=False)
+    star_payload = {
+        "star_id": data.star_ids,
+        "mag_norm": state.mag_norm,
+    }
+    if param_sigma is not None and slices is not None:
+        star_payload["mag_norm_sigma"] = param_sigma[slices["norm"]]
+    for component_id in range(data.sed_library.n_components):
+        star_payload[f"sed_coeff_{component_id}"] = state.sed_coeff[:, component_id]
+        if param_sigma is not None and slices is not None:
+            sigma_start = slices["sed_coeff"].start + component_id
+            star_payload[f"sed_coeff_{component_id}_sigma"] = param_sigma[
+                sigma_start : slices["sed_coeff"].stop : data.sed_library.n_components
+            ]
+    pd.DataFrame(star_payload).to_csv(output_dir / "fit_star_params.csv", index=False)
 
     pass_rows = []
     for filt_i, filt in enumerate(data.filter_ids):
@@ -852,7 +875,9 @@ def print_diagnostics(
     print(f"Number of stars: {data.star_ids.size}")
     print(f"Number of filters: {data.filter_ids.size}")
     print(f"Number of detectors: {data.detector_ids.size}")
-    n_params = 3 * data.star_ids.size + 2 * data.filter_ids.size * data.detector_ids.size
+    print(f"Number of BOSZ EMPCA SED components: {data.sed_library.n_components}")
+    n_params = (1 + data.sed_library.n_components) * data.star_ids.size
+    n_params += 2 * data.filter_ids.size * data.detector_ids.size
     n_params += data.ice_thickness_nodes.size * data.ice_loglam_nodes.size
     print(f"Number of fitted linearized parameters per iteration: {n_params}")
     print(f"Initial RMS residual: {summary.iloc[0]['rms_residual']:.6f} mag")
@@ -876,12 +901,19 @@ def print_diagnostics(
         _, _, true_surface = ice_surface_on_grid(data, true_ice)
         _, _, fit_surface = ice_surface_on_grid(data, state.ice_coeff)
         print(f"Ice log-throughput surface RMS error: {rms(fit_surface - true_surface):.6f}")
+    if data.true_star_params is not None:
+        coeff_cols = [f"sed_coeff_{i}" for i in range(data.sed_library.n_components)]
+        if all(col in data.true_star_params.columns for col in coeff_cols):
+            truth = data.true_star_params.set_index("star_id").loc[data.star_ids]
+            true_coeff = truth[coeff_cols].to_numpy(float)
+            print(f"Stellar EMPCA coefficient RMS error: {rms(state.sed_coeff - true_coeff):.6f}")
     if param_sigma is not None and slices is not None:
         ice_sigma = param_sigma[slices["ice"]]
         print(f"Median formal ice-node uncertainty: {np.median(ice_sigma):.6f}")
     print(
-        "Note: stellar extinction, passband color terms, and ice surface modes remain "
-        "partially degenerate; recovery depends on priors and ice-amount leverage."
+        "Note: stellar EMPCA coefficients, passband color terms, and ice surface "
+        "modes remain partially degenerate; recovery depends on priors and "
+        "ice-thickness leverage."
     )
 
 
@@ -1051,24 +1083,48 @@ def make_plots(
 
     if data.true_star_params is not None:
         truth = data.true_star_params.set_index("star_id").loc[data.star_ids]
-        plt.figure(figsize=(10, 4.5))
-        plt.subplot(1, 2, 1)
-        plt.scatter(truth["temperature_k"], state.temperature, s=5, alpha=0.35)
-        tmin = min(truth["temperature_k"].min(), state.temperature.min())
-        tmax = max(truth["temperature_k"].max(), state.temperature.max())
-        plt.plot([tmin, tmax], [tmin, tmax], color="0.2", linewidth=1)
-        plt.xlabel("True temperature [K]")
-        plt.ylabel("Fitted temperature [K]")
-        plt.subplot(1, 2, 2)
-        plt.scatter(truth["extinction"], state.extinction, s=5, alpha=0.35)
-        emax = max(truth["extinction"].max(), state.extinction.max())
-        plt.plot([0, emax], [0, emax], color="0.2", linewidth=1)
-        plt.xlabel("True extinction")
-        plt.ylabel("Fitted extinction")
-        plt.suptitle("Stellar parameter recovery")
-        plt.tight_layout()
-        plt.savefig(output_dir / "stellar_param_recovery.png", dpi=160)
-        plt.close()
+        coeff_cols = [f"sed_coeff_{i}" for i in range(data.sed_library.n_components)]
+        if all(col in truth.columns for col in coeff_cols):
+            parameters = [
+                ("mag_norm", truth["mag_norm"].to_numpy(float), state.mag_norm)
+            ]
+            for component_id, col in enumerate(coeff_cols):
+                parameters.append(
+                    (
+                        f"coeff {component_id}",
+                        truth[col].to_numpy(float),
+                        state.sed_coeff[:, component_id],
+                    )
+                )
+
+            n_cols = len(parameters)
+            fig, axes = plt.subplots(
+                2,
+                n_cols,
+                figsize=(3.5 * n_cols, 7.0),
+                squeeze=False,
+            )
+            for col_index, (label, true_values, fit_values) in enumerate(parameters):
+                recovery_ax = axes[0, col_index]
+                residual_ax = axes[1, col_index]
+                residual = fit_values - true_values
+
+                recovery_ax.scatter(true_values, fit_values, s=5, alpha=0.35)
+                vmin = min(true_values.min(), fit_values.min())
+                vmax = max(true_values.max(), fit_values.max())
+                recovery_ax.plot([vmin, vmax], [vmin, vmax], color="0.2", linewidth=1)
+                recovery_ax.set_title(label)
+                recovery_ax.set_xlabel(f"True {label}")
+                recovery_ax.set_ylabel(f"Fitted {label}")
+
+                residual_ax.scatter(true_values, residual, s=5, alpha=0.35)
+                residual_ax.axhline(0.0, color="0.2", linewidth=1)
+                residual_ax.set_xlabel(f"True {label}")
+                residual_ax.set_ylabel("Fit - true")
+            plt.suptitle("Stellar BOSZ EMPCA parameter recovery")
+            plt.tight_layout()
+            plt.savefig(output_dir / "stellar_param_recovery.png", dpi=160)
+            plt.close()
 
     bins = np.linspace(
         np.percentile(final_resid, 0.2),
@@ -1101,6 +1157,7 @@ def parse_args() -> FitConfig:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-dir", default=FitConfig.input_dir)
     parser.add_argument("--output-dir", default=FitConfig.output_dir)
+    parser.add_argument("--sed-basis-path", default=FitConfig.sed_basis_path)
     parser.add_argument("--n-iter", type=int, default=FitConfig.n_iter)
     parser.add_argument("--damping", type=float, default=FitConfig.damping)
     parser.add_argument("--max-stars", type=int, default=None)
@@ -1108,6 +1165,7 @@ def parse_args() -> FitConfig:
     return FitConfig(
         input_dir=args.input_dir,
         output_dir=args.output_dir,
+        sed_basis_path=args.sed_basis_path,
         n_iter=args.n_iter,
         damping=args.damping,
         max_stars=args.max_stars,

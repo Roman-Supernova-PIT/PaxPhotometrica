@@ -7,8 +7,9 @@ Telescope WFI-style calibration experiments.
   stellar magnitudes, exposure zeropoints, smooth star-flat structure, and
   per-amplifier offsets.
 - The second prototype fits chromatic calibration terms after scalar
-  instrumental calibration: stellar SED parameters, detector-level passband
-  shifts/width changes, and a 2D ice log-throughput surface.
+  instrumental calibration: stellar BOSZ EMPCA SED coefficients,
+  detector-level passband shifts/width changes, and a 2D ice log-throughput
+  surface.
 
 Both prototypes use deterministic simulations, sparse linear algebra, and CSV
 artifacts intended to be easy to inspect.
@@ -200,7 +201,11 @@ Notation:
   models; v1 passband shift/width terms are detector-level constants.
 - `e`: epoch/exposure index used for time-dependent ice state.
 - `h_obs`: known ice-thickness coordinate for a specific observation.
-- `f_s(lambda)`: spectral energy distribution of star `s`.
+- `f_s(lambda)`: spectral energy distribution of star `s`. In the current
+  prototype this is a BOSZ EMPCA relative SED shape,
+  `exp(mean_log_flux + theta_s @ components)`, multiplied by a fitted magnitude
+  normalization.
+- `theta_s`: low-dimensional BOSZ EMPCA coefficient vector for star `s`.
 - `T_b(lambda, d, x, y, e)`: total throughput for filter `b` for that
   detector, position, and epoch.
 - `T0_b(lambda)`: nominal throughput curve read from `passbands.txt`.
@@ -217,10 +222,17 @@ Notation:
 
 - `passbands.txt`: supplied Roman nominal relative throughputs for six filters:
   `F062`, `F087`, `F106`, `F129`, `F158`, and `F184`.
+- `bosz_logflux_empca_basis.npz`: normalized log-flux BOSZ EMPCA basis used for
+  simulated and fitted stellar SED shapes.
+- `bosz2024_wave_r500.txt`: wavelength grid for the local BOSZ source spectra.
+- `m+0.00/`: local BOSZ source spectra used to build the EMPCA basis; filenames
+  encode the stellar effective temperature, but the fitter uses only the EMPCA
+  coefficients.
 - `ice_loglam_nodes.txt`: default log10 wavelength nodes used for the ice
   spline grid. The simulator can read a different node file.
 - `simulate_roman_passband_data.py`: generates six-filter photometry using
-  `passbands.txt`, passband modes, a 2D ice spline surface, and truth files.
+  `passbands.txt`, BOSZ EMPCA stellar SEDs, passband modes, a 2D ice spline
+  surface, and truth files.
 - `fit_roman_passband_model.py`: reads the simulator products and runs an
   iterative sparse linearized fit.
 - `passband_sim_outputs/measurements.csv`: simulated flattened stellar
@@ -232,9 +244,16 @@ Notation:
   log10 wavelength and ice thickness.
 - `passband_sim_outputs/true_ice_spline_params.csv`: true ice log-throughput
   values at the spline grid nodes.
-- `passband_sim_outputs/true_*params.csv`: simulator truth files.
+- `passband_sim_outputs/true_star_params.csv`: true star magnitude
+  normalizations, selected BOSZ model IDs/files, and `sed_coeff_*` EMPCA
+  coefficients.
+- `passband_sim_outputs/true_passband_params.csv`: true detector-level
+  passband shift and width coefficients.
 - `passband_fit_outputs/fit_*params.csv`: recovered stellar, passband, and ice
   parameters.
+- `passband_fit_outputs/fit_star_params.csv`: recovered star magnitude
+  normalizations and `sed_coeff_*` EMPCA coefficients, with formal
+  `mag_norm` and coefficient sigmas from LSQR when available.
 - `passband_fit_outputs/fit_ice_spline_params.csv`: recovered ice spline node
   values and formal node uncertainties from the final LSQR variance estimate.
 - `passband_fit_outputs/fit_iteration_summary.csv`: residual RMS by iteration.
@@ -255,6 +274,7 @@ Useful fitter options:
 /opt/anaconda3/bin/python fit_roman_passband_model.py --n-iter 3
 /opt/anaconda3/bin/python fit_roman_passband_model.py --max-stars 200
 /opt/anaconda3/bin/python fit_roman_passband_model.py --input-dir passband_sim_outputs --output-dir passband_fit_outputs
+/opt/anaconda3/bin/python fit_roman_passband_model.py --sed-basis-path bosz_logflux_empca_basis.npz
 ```
 
 Useful simulator options:
@@ -263,11 +283,41 @@ Useful simulator options:
 /opt/anaconda3/bin/python simulate_roman_passband_data.py --n-ice-thickness-nodes 7
 /opt/anaconda3/bin/python simulate_roman_passband_data.py --ice-loglam-nodes-file my_nodes.txt
 /opt/anaconda3/bin/python simulate_roman_passband_data.py --ice-thickness-min 0.0 --ice-thickness-max 1.5
+/opt/anaconda3/bin/python simulate_roman_passband_data.py --sed-basis-path bosz_logflux_empca_basis.npz
 ```
 
 The default simulator uses one detector, six supplied Roman passbands, `2,000`
 stars, and `30` exposures. The scripts are structured so the detector axis can
 be expanded later.
+
+### Stellar SED Basis
+
+The passband prototype uses `bosz_logflux_empca_basis.npz` instead of an
+analytic blackbody/extinction family. The basis contains:
+
+```text
+wave_micron
+mean_log_flux
+components
+coefficients
+model_files
+valid_mask
+metadata
+```
+
+For a star with EMPCA coefficient vector `theta_s`, the relative SED shape is
+
+```text
+sed_shape(lambda) = exp(mean_log_flux(lambda) + theta_s @ components(lambda))
+```
+
+The EMPCA basis has arbitrary absolute normalization removed. The simulator
+therefore draws a separate `mag_norm` for each star, and the fitter solves for
+that magnitude normalization independently of the `sed_coeff_*` shape
+parameters. The current basis file in this directory has 4 EMPCA components and
+56 input BOSZ model coefficient vectors. The simulator draws true stars from
+those stored coefficient vectors so the synthetic colors remain on the BOSZ
+training manifold.
 
 ### Measurement Table
 
@@ -327,19 +377,22 @@ Column meanings:
 ### Fitting Method
 
 Iteration 0 fits initial stellar SED parameters star-by-star using nominal
-passbands and ignoring passband/ice perturbations. Later iterations build a
-sparse linearized system for magnitude residuals and solve updates for:
+passbands and ignoring passband/ice perturbations. It searches over the BOSZ
+EMPCA coefficient vectors stored in the basis file and solves each star's
+magnitude normalization analytically. Later iterations build a sparse
+linearized system for magnitude residuals and solve updates for:
 
 - per-star magnitude normalization,
-- per-star temperature-like SED parameter,
-- per-star extinction-like parameter,
+- per-star BOSZ EMPCA SED coefficients,
 - per-filter/per-detector passband shift,
 - per-filter/per-detector passband width,
 - global ice log-throughput spline node values.
 
-The response for each passband mode or ice spline node is computed from the
-current stellar SED and current throughput with the proper broadband flux
-integral. Updates are damped before being applied.
+The response for each stellar coefficient, passband mode, or ice spline node is
+computed from the current stellar SED and current throughput with the proper
+broadband flux integral. Since the BOSZ coefficients are linear in log SED, the
+stellar coefficient response uses the same flux-weighted integral form as the
+log-throughput response modes. Updates are damped before being applied.
 
 After the final iteration, the fitter rebuilds the weighted linearized system
 and runs SciPy `lsqr` with `calc_var=True`. This gives a formal diagonal
@@ -350,16 +403,17 @@ read as a quick diagnostic rather than a full posterior uncertainty surface.
 
 ### Regularization And Degeneracies
 
-The chromatic problem has real degeneracies among stellar SED colors, passband
-color terms, and ice surface modes. The fitter uses weighted pseudo-observation
-rows for weak priors:
+The chromatic problem has real degeneracies among stellar SED coefficients,
+passband color terms, and ice surface modes. The fitter uses weighted
+pseudo-observation rows for weak priors:
 
 - passband shift prior: `sigma_shift_prior = 0.02 um`,
 - passband width prior: `sigma_width_prior = 0.05`,
 - ice spline node prior: `sigma_ice_prior = 0.10`,
 - zero-thickness ice-surface prior: `sigma_zero_ice_surface_prior = 1e-4`,
-- stellar temperature update prior: `sigma_temp_update_prior = 400 K`,
-- stellar extinction update prior: `sigma_ext_update_prior = 0.05`.
+- stellar EMPCA coefficient update prior:
+  `sigma_sed_coeff_update_prior_scale = 0.25` times the empirical standard
+  deviation of each BOSZ coefficient in the basis file.
 
 These priors stabilize the linearized fit but do not remove all degeneracy. The
 diagnostics intentionally show imperfect passband and stellar-parameter
@@ -381,24 +435,25 @@ log-throughput perturbation.
 
 ### Default Verification
 
-A default run currently produces `55,071` observations and solves `6,057`
+A default run currently produces `55,032` observations and solves `10,057`
 linearized update parameters per iteration. The verified iteration summary is:
 
 ```text
 iteration  RMS residual [mag]
-0          0.011891
-1          0.020244
-2          0.011342
-3          0.007179
-4          0.005564
-5          0.005058
+0          0.022543
+1          0.011789
+2          0.007273
+3          0.005416
+4          0.004784
+5          0.004592
 ```
 
 Final default diagnostics:
 
 ```text
-Passband shift RMS error: 0.004273 um
-Passband width RMS error: 0.003938
-Ice log-throughput surface RMS error: 0.011814
-Median formal ice-node uncertainty: 0.006953
+Passband shift RMS error: 0.001469 um
+Passband width RMS error: 0.012801
+Ice log-throughput surface RMS error: 0.013448
+Stellar EMPCA coefficient RMS error: 0.243813
+Median formal ice-node uncertainty: 0.008151
 ```
