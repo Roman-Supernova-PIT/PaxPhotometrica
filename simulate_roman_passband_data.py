@@ -33,6 +33,11 @@ import numpy as np
 import pandas as pd
 
 
+SPEED_OF_LIGHT_CM_S = 2.99792458e10
+MICRON_TO_CM = 1.0e-4
+AB_FNU_CGS = 3631.0e-23  # erg / s / cm^2 / Hz
+
+
 @dataclass
 class SimConfig:
     random_seed: int = 12345
@@ -43,6 +48,7 @@ class SimConfig:
     ny: int = 4096
     n_amp: int = 32
     n_filter: int = 6
+    reference_filter_id: int = 3
     n_absolute_calibrator: int = 5
     wave_min: float = 0.45
     wave_max: float = 2.30
@@ -120,13 +126,30 @@ class BOSZEMPCASEDLibrary:
         clone.metadata = self.metadata
         return clone
 
-    def sed_from_coefficients(self, theta: np.ndarray, mag_norm: np.ndarray) -> np.ndarray:
-        """Evaluate relative SEDs for one or many EMPCA coefficient vectors."""
+    def sed_shape_from_coefficients(self, theta: np.ndarray) -> np.ndarray:
+        """Evaluate unitless relative SED shapes for one or many coefficient vectors."""
         theta = np.asarray(theta, dtype=float)
-        mag_norm = np.asarray(mag_norm, dtype=float)
         log_sed = self.mean_log_flux + theta @ self.components
-        scale = 10.0 ** (-0.4 * mag_norm)
-        return scale[..., None] * np.exp(log_sed)
+        return np.exp(log_sed)
+
+    def sed_from_coefficients(
+        self, theta: np.ndarray, mag_norm: np.ndarray, reference_passband: np.ndarray
+    ) -> np.ndarray:
+        """Evaluate physical-scale SEDs with ``mag_norm`` as reference AB mag.
+
+        The EMPCA basis stores only relative log-flux shapes. We assign an
+        amplitude by requiring each SED to have AB magnitude ``mag_norm`` in the
+        configured reference passband. Flux density is returned per micron in
+        arbitrary-but-AB-consistent cgs units.
+        """
+        shape = self.sed_shape_from_coefficients(theta)
+        mag_norm = np.asarray(mag_norm, dtype=float)
+        shape_count = photon_count_integral(
+            shape * reference_passband[None, :], self.wave_micron, axis=1
+        )
+        ab_count = ab_reference_count(self.wave_micron, reference_passband)
+        scale = ab_count * 10.0 ** (-0.4 * mag_norm) / np.maximum(shape_count, 1e-300)
+        return scale[..., None] * shape
 
 
 def trapz_integral(y: np.ndarray, wave: np.ndarray, axis: int = -1) -> np.ndarray:
@@ -134,6 +157,33 @@ def trapz_integral(y: np.ndarray, wave: np.ndarray, axis: int = -1) -> np.ndarra
     if hasattr(np, "trapezoid"):
         return np.trapezoid(y, wave, axis=axis)
     return np.trapz(y, wave, axis=axis)
+
+
+def ab_f_lambda_per_micron(wave_um: np.ndarray) -> np.ndarray:
+    """AB reference spectrum, flat f_nu=3631 Jy, as f_lambda per micron."""
+    wave_cm = np.asarray(wave_um, dtype=float) * MICRON_TO_CM
+    return AB_FNU_CGS * SPEED_OF_LIGHT_CM_S / wave_cm**2 * MICRON_TO_CM
+
+
+def photon_count_integral(y: np.ndarray, wave_um: np.ndarray, axis: int = -1) -> np.ndarray:
+    """Photon-counting integral up to the constant 1/(hc).
+
+    For wavelength-grid flux density per micron, counts are proportional to
+    integral f_lambda(lambda) T(lambda) lambda dlambda. The missing constant
+    cancels in AB ratios.
+    """
+    return trapz_integral(y * np.asarray(wave_um), wave_um, axis=axis)
+
+
+def ab_reference_count(wave_um: np.ndarray, throughput: np.ndarray) -> float:
+    """Photon-counting AB reference integral for one passband."""
+    return float(photon_count_integral(ab_f_lambda_per_micron(wave_um) * throughput, wave_um))
+
+
+def flux_to_abmag(count_flux: np.ndarray, wave_um: np.ndarray, throughput: np.ndarray) -> np.ndarray:
+    """Convert photon-counting flux integral to AB magnitude."""
+    ref = ab_reference_count(wave_um, throughput)
+    return -2.5 * np.log10(np.maximum(count_flux, 1e-300) / ref)
 
 
 def amp_id_from_x(x: np.ndarray, nx: int = 4096, n_amp: int = 32) -> np.ndarray:
@@ -356,10 +406,6 @@ def interpolate_ice_surface(
     return w_lo * surface_lo + w_hi * surface_hi
 
 
-def flux_to_mag(flux: np.ndarray) -> np.ndarray:
-    return -2.5 * np.log10(np.maximum(flux, 1e-300))
-
-
 def write_passband_files(
     output_dir: Path,
     wave: np.ndarray,
@@ -439,6 +485,9 @@ def simulate_data(config: SimConfig) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     wave, passbands, filter_centers, filter_names = read_nominal_passbands(config)
+    if not 0 <= config.reference_filter_id < passbands.shape[0]:
+        raise ValueError("reference_filter_id must select one of the loaded passbands")
+    reference_passband = passbands[config.reference_filter_id]
     sed_library = BOSZEMPCASEDLibrary(config.sed_basis_path).resampled_to(wave)
     phi_shift, phi_width = make_passband_modes(wave, passbands, filter_centers, config)
     loglam_nodes = read_ice_loglam_nodes(config, wave)
@@ -543,7 +592,9 @@ def simulate_data(config: SimConfig) -> None:
     exposure_ice = 0.55 + 0.35 * np.sin(slow_phase) + rng.normal(0.0, 0.07, config.n_exp)
     exposure_ice = np.clip(exposure_ice, 0.02, 1.20)
 
-    sed_all = sed_library.sed_from_coefficients(true_sed_coeff, true_mag_norm)
+    sed_all = sed_library.sed_from_coefficients(
+        true_sed_coeff, true_mag_norm, reference_passband
+    )
 
     rows = []
     obs_id = 0
@@ -597,12 +648,12 @@ def simulate_data(config: SimConfig) -> None:
             t_pass = t0 * np.exp(logt_pass)
             t_true = t0 * np.exp(logt_true)
 
-            flux_nominal = trapz_integral(sed * t0, wave)
-            flux_pass = trapz_integral(sed * t_pass, wave)
-            flux_true = trapz_integral(sed * t_true, wave)
-            mag_nominal = flux_to_mag(flux_nominal)
-            mag_pass = flux_to_mag(flux_pass)
-            mag_chromatic = flux_to_mag(flux_true)
+            flux_nominal = photon_count_integral(sed * t0, wave)
+            flux_pass = photon_count_integral(sed * t_pass, wave)
+            flux_true = photon_count_integral(sed * t_true, wave)
+            mag_nominal = flux_to_abmag(flux_nominal, wave, t0)
+            mag_pass = flux_to_abmag(flux_pass, wave, t0)
+            mag_chromatic = flux_to_abmag(flux_true, wave, t0)
             mag_true = mag_chromatic + scalar_delta
             mag_obs = mag_true + rng.normal(0.0, config.phot_sigma_mag)
 
@@ -648,6 +699,10 @@ def simulate_data(config: SimConfig) -> None:
     metadata["detector_ids"] = detector_ids.tolist()
     metadata["filter_names"] = filter_names
     metadata["filter_centers_um"] = filter_centers.tolist()
+    metadata["reference_filter_id"] = int(config.reference_filter_id)
+    metadata["reference_filter_name"] = filter_names[config.reference_filter_id]
+    metadata["magnitude_system"] = "AB"
+    metadata["synthetic_photometry"] = "photon_counting_f_lambda_T_lambda_lambda_dlambda"
     metadata["ice_loglam_nodes_file"] = config.ice_loglam_nodes_file
     metadata["n_ice_loglam_nodes"] = int(loglam_nodes.size)
     metadata["n_ice_thickness_nodes"] = int(thickness_nodes.size)
@@ -732,6 +787,7 @@ def parse_args() -> SimConfig:
     parser.add_argument("--output-dir", default=SimConfig.output_dir)
     parser.add_argument("--passband-file", default=SimConfig.passband_file)
     parser.add_argument("--sed-basis-path", default=SimConfig.sed_basis_path)
+    parser.add_argument("--reference-filter-id", type=int, default=SimConfig.reference_filter_id)
     parser.add_argument("--n-absolute-calibrator", type=int, default=SimConfig.n_absolute_calibrator)
     parser.add_argument("--ice-loglam-nodes-file", default=SimConfig.ice_loglam_nodes_file)
     parser.add_argument("--n-ice-thickness-nodes", type=int, default=SimConfig.n_ice_thickness_nodes)
@@ -742,6 +798,7 @@ def parse_args() -> SimConfig:
         output_dir=args.output_dir,
         passband_file=args.passband_file,
         sed_basis_path=args.sed_basis_path,
+        reference_filter_id=args.reference_filter_id,
         n_absolute_calibrator=args.n_absolute_calibrator,
         ice_loglam_nodes_file=args.ice_loglam_nodes_file,
         n_ice_thickness_nodes=args.n_ice_thickness_nodes,

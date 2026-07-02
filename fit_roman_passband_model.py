@@ -37,6 +37,9 @@ from scipy.sparse.linalg import lsmr, lsqr
 
 
 MAG_FACTOR = 2.5 / np.log(10.0)
+SPEED_OF_LIGHT_CM_S = 2.99792458e10
+MICRON_TO_CM = 1.0e-4
+AB_FNU_CGS = 3631.0e-23  # erg / s / cm^2 / Hz
 
 
 class BOSZEMPCASEDLibrary:
@@ -84,13 +87,24 @@ class BOSZEMPCASEDLibrary:
         clone.metadata = self.metadata
         return clone
 
-    def sed_from_coefficients(self, theta: np.ndarray, mag_norm: np.ndarray) -> np.ndarray:
-        """Evaluate relative SEDs for one or many EMPCA coefficient vectors."""
+    def sed_shape_from_coefficients(self, theta: np.ndarray) -> np.ndarray:
+        """Evaluate unitless relative SED shapes for one or many coefficient vectors."""
         theta = np.asarray(theta, dtype=float)
-        mag_norm = np.asarray(mag_norm, dtype=float)
         log_sed = self.mean_log_flux + theta @ self.components
-        scale = 10.0 ** (-0.4 * np.asarray(mag_norm, dtype=float))
-        return scale[..., None] * np.exp(log_sed)
+        return np.exp(log_sed)
+
+    def sed_from_coefficients(
+        self, theta: np.ndarray, mag_norm: np.ndarray, reference_passband: np.ndarray
+    ) -> np.ndarray:
+        """Evaluate physical-scale SEDs with ``mag_norm`` as reference AB mag."""
+        shape = self.sed_shape_from_coefficients(theta)
+        mag_norm = np.asarray(mag_norm, dtype=float)
+        shape_count = photon_count_integral(
+            shape * reference_passband[None, :], self.wave_micron, axis=1
+        )
+        ab_count = ab_reference_count(self.wave_micron, reference_passband)
+        scale = ab_count * 10.0 ** (-0.4 * mag_norm) / np.maximum(shape_count, 1e-300)
+        return scale[..., None] * shape
 
 
 @dataclass
@@ -132,6 +146,7 @@ class DataBundle:
     free_star_indices: np.ndarray
     free_star_index: np.ndarray
     passbands: np.ndarray
+    reference_filter_index: int
     phi_shift: np.ndarray
     phi_width: np.ndarray
     sed_library: BOSZEMPCASEDLibrary
@@ -178,6 +193,28 @@ def trapz_integral(y: np.ndarray, wave: np.ndarray, axis: int = -1) -> np.ndarra
     return np.trapz(y, wave, axis=axis)
 
 
+def ab_f_lambda_per_micron(wave_um: np.ndarray) -> np.ndarray:
+    """AB reference spectrum, flat f_nu=3631 Jy, as f_lambda per micron."""
+    wave_cm = np.asarray(wave_um, dtype=float) * MICRON_TO_CM
+    return AB_FNU_CGS * SPEED_OF_LIGHT_CM_S / wave_cm**2 * MICRON_TO_CM
+
+
+def photon_count_integral(y: np.ndarray, wave_um: np.ndarray, axis: int = -1) -> np.ndarray:
+    """Photon-counting integral up to the constant 1/(hc)."""
+    return trapz_integral(y * np.asarray(wave_um), wave_um, axis=axis)
+
+
+def ab_reference_count(wave_um: np.ndarray, throughput: np.ndarray) -> float:
+    """Photon-counting AB reference integral for one passband."""
+    return float(photon_count_integral(ab_f_lambda_per_micron(wave_um) * throughput, wave_um))
+
+
+def flux_to_abmag(count_flux: np.ndarray, wave_um: np.ndarray, throughput: np.ndarray) -> np.ndarray:
+    """Convert photon-counting flux integral to AB magnitude."""
+    ref = ab_reference_count(wave_um, throughput)
+    return -2.5 * np.log10(np.maximum(count_flux, 1e-300) / ref)
+
+
 def amp_id_from_x(x: np.ndarray, nx: int = 4096, n_amp: int = 32) -> np.ndarray:
     """Return amplifier stripe id for detector x pixel coordinate."""
     amp_width = nx // n_amp
@@ -199,10 +236,6 @@ def poly_basis(xn: np.ndarray, yn: np.ndarray) -> np.ndarray:
     xn = np.asarray(xn)
     yn = np.asarray(yn)
     return np.column_stack((xn, yn, xn**2, xn * yn, yn**2))
-
-
-def flux_to_mag(flux: np.ndarray) -> np.ndarray:
-    return -2.5 * np.log10(np.maximum(flux, 1e-300))
 
 
 def load_long_grid_csv(path: Path, value_columns: list[str], id_column: str) -> tuple[np.ndarray, dict]:
@@ -360,6 +393,10 @@ def load_data(config: FitConfig) -> DataBundle:
     passbands = pass_data["throughput"][pass_indices]
     phi_shift = mode_data["phi_shift"][pass_indices]
     phi_width = mode_data["phi_width"][pass_indices]
+    reference_filter_id = int(sim_metadata.get("reference_filter_id", filter_ids[min(3, filter_ids.size - 1)]))
+    if reference_filter_id not in filter_lookup:
+        raise ValueError("Reference filter is not present in the fitted measurement subset")
+    reference_filter_index = filter_lookup[reference_filter_id]
 
     denom = trapz_integral(passbands, wave, axis=1)
     filter_eff = trapz_integral(passbands * wave[None, :], wave, axis=1) / denom
@@ -408,6 +445,7 @@ def load_data(config: FitConfig) -> DataBundle:
         free_star_indices=free_star_indices,
         free_star_index=free_star_index,
         passbands=passbands,
+        reference_filter_index=reference_filter_index,
         phi_shift=phi_shift,
         phi_width=phi_width,
         sed_library=sed_library,
@@ -429,14 +467,17 @@ def load_data(config: FitConfig) -> DataBundle:
 def make_initial_sed_grid(data: DataBundle) -> tuple[np.ndarray, np.ndarray]:
     """Precompute nominal-passband colors for each BOSZ EMPCA template."""
     grid_coeff = data.sed_library.coefficients
+    reference_passband = data.passbands[data.reference_filter_index]
     sed_shape = data.sed_library.sed_from_coefficients(
-        grid_coeff, np.zeros(grid_coeff.shape[0])
+        grid_coeff, np.zeros(grid_coeff.shape[0]), reference_passband
     )
 
     shape_mag = np.zeros((grid_coeff.shape[0], data.filter_ids.size))
     for filt in range(data.filter_ids.size):
-        flux = trapz_integral(sed_shape * data.passbands[filt][None, :], data.wave, axis=1)
-        shape_mag[:, filt] = flux_to_mag(flux)
+        flux = photon_count_integral(
+            sed_shape * data.passbands[filt][None, :], data.wave, axis=1
+        )
+        shape_mag[:, filt] = flux_to_abmag(flux, data.wave, data.passbands[filt])
     return grid_coeff, shape_mag
 
 
@@ -524,9 +565,11 @@ def evaluate_model_and_responses(
         amp = data.amp_id[sl]
         ice = ice_thickness[sl]
 
+        reference_passband = data.passbands[data.reference_filter_index]
         sed = data.sed_library.sed_from_coefficients(
             state.sed_coeff[star],
             state.mag_norm[star],
+            reference_passband,
         )
         logt = (
             state.shift[filt, det][:, None] * data.phi_shift[filt]
@@ -540,41 +583,57 @@ def evaluate_model_and_responses(
         )
         t_current = data.passbands[filt] * np.exp(logt)
         weighted = sed * t_current
-        denom = trapz_integral(weighted, data.wave, axis=1)
+        denom = photon_count_integral(weighted, data.wave, axis=1)
         xn, yn = normalized_xy(x_pix[sl], y_pix[sl], nx=config.nx, ny=config.ny)
         smooth = poly_basis(xn, yn) @ state.smooth_coeff
         scalar = state.zp[exp_id] + smooth + state.amp_offset[det, amp]
-        mag_model[sl] = flux_to_mag(denom) + scalar
+        ref_count = np.array(
+            [ab_reference_count(data.wave, data.passbands[filt_id]) for filt_id in filt]
+        )
+        mag_model[sl] = -2.5 * np.log10(np.maximum(denom, 1e-300) / ref_count) + scalar
 
         if not need_responses:
             continue
 
         # The BOSZ EMPCA coefficients perturb normalized log flux:
         # log f_s(lambda) = mean_log_flux + theta @ components + log amplitude.
-        # Therefore d mag / d theta_c uses the same flux-weighted integral form
-        # as the log-throughput response modes.
+        # Because mag_norm is defined as the AB magnitude in a reference
+        # passband, coefficient updates change colors at fixed reference-band
+        # magnitude. The derivative therefore subtracts the reference-passband
+        # component average.
+        ref_weighted = sed * reference_passband[None, :]
+        ref_denom = photon_count_integral(ref_weighted, data.wave, axis=1)
         for component_id in range(n_sed_coeff):
-            d_sed_coeff[sl, component_id] = -MAG_FACTOR * (
-                trapz_integral(
+            obs_mean = (
+                photon_count_integral(
                     weighted * data.sed_library.components[component_id][None, :],
                     data.wave,
                     axis=1,
                 )
                 / denom
             )
+            ref_mean = (
+                photon_count_integral(
+                    ref_weighted * data.sed_library.components[component_id][None, :],
+                    data.wave,
+                    axis=1,
+                )
+                / ref_denom
+            )
+            d_sed_coeff[sl, component_id] = -MAG_FACTOR * (obs_mean - ref_mean)
 
         r_shift[sl] = -MAG_FACTOR * (
-            trapz_integral(weighted * data.phi_shift[filt], data.wave, axis=1) / denom
+            photon_count_integral(weighted * data.phi_shift[filt], data.wave, axis=1) / denom
         )
         r_width[sl] = -MAG_FACTOR * (
-            trapz_integral(weighted * data.phi_width[filt], data.wave, axis=1) / denom
+            photon_count_integral(weighted * data.phi_width[filt], data.wave, axis=1) / denom
         )
         n_loglam = data.ice_loglam_nodes.size
         lo, hi, w_lo, w_hi = thickness_brackets(ice, data.ice_thickness_nodes)
         loglam_integrals = np.zeros((end - start, n_loglam))
         for loglam_id in range(n_loglam):
             loglam_integrals[:, loglam_id] = trapz_integral(
-                weighted * data.ice_loglam_basis[loglam_id][None, :],
+                weighted * data.ice_loglam_basis[loglam_id][None, :] * data.wave[None, :],
                 data.wave,
                 axis=1,
             )

@@ -327,6 +327,7 @@ Useful simulator options:
 /opt/anaconda3/bin/python simulate_roman_passband_data.py --ice-loglam-nodes-file my_nodes.txt
 /opt/anaconda3/bin/python simulate_roman_passband_data.py --ice-thickness-min 0.0 --ice-thickness-max 1.5
 /opt/anaconda3/bin/python simulate_roman_passband_data.py --sed-basis-path bosz_logflux_empca_basis.npz
+/opt/anaconda3/bin/python simulate_roman_passband_data.py --reference-filter-id 3
 /opt/anaconda3/bin/python simulate_roman_passband_data.py --n-absolute-calibrator 50
 ```
 
@@ -370,43 +371,58 @@ assumed known exactly by this prototype. The fitter uses their fixed SEDs in
 the forward model and omits their stellar normalization/coefficient update
 columns from the sparse least-squares system.
 
-### Synthetic Photometry And Magnitudes
+### Synthetic Photometry And AB Magnitudes
 
-The prototype uses instrumental/model magnitudes, not calibrated AB magnitudes.
-The synthetic broadband flux for one observation is computed on the passband
+The prototype now uses AB magnitudes with a photon-counting convention. The
+BOSZ EMPCA basis still provides relative SED shapes, so the simulator assigns
+each star an amplitude by requiring `mag_norm` to be that star's AB magnitude
+in a reference filter. By default the reference filter is
+`reference_filter_id = 3`, i.e. `F129` for the supplied six-filter file.
+
+The source count integral for one observation is computed on the passband
 wavelength grid as
 
 ```text
-F = integral sed_shape_s(lambda)
-             * 10^(-0.4 mag_norm_s)
-             * T0_b(lambda)
-             * exp(logT_passband + logT_ice)
-             d lambda
+C_source = integral f_lambda,s(lambda)
+                  * T0_b(lambda)
+                  * exp(logT_passband + logT_ice)
+                  * lambda
+                  d lambda
 ```
 
-where `sed_shape_s(lambda) = exp(mean_log_flux + theta_s @ components)` and
-`T0_b(lambda)` is the relative throughput from `passbands.txt`. The simulator
-uses `np.trapezoid`/`np.trapz` for this integral. The current toy integral does
-not include a photon-counting `lambda / hc` factor, a filter-normalization
-denominator, or a physical reference spectrum.
+where `f_lambda,s(lambda)` is the BOSZ EMPCA shape scaled to the star's
+reference-filter AB magnitude. The constant `1 / hc` is omitted because it
+cancels in the source/reference ratio.
 
-Flux is converted to magnitude with
+For the same passband, the AB reference count is
 
 ```text
-m_chromatic = -2.5 log10(F)
+C_AB = integral f_lambda,AB(lambda) * T0_b(lambda) * lambda d lambda
 ```
 
-and then the scalar calibration terms are added:
+where `f_nu,AB = 3631 Jy` and
+
+```text
+f_lambda,AB(lambda) = f_nu,AB * c / lambda^2
+```
+
+with the unit conversion needed for wavelength in microns. The chromatic
+magnitude is then
+
+```text
+m_chromatic = -2.5 log10(C_source / C_AB)
+```
+
+and the scalar calibration terms are added:
 
 ```text
 m_true = m_chromatic + ZP_e + S_smooth(x, y) + A_detector,amp
 ```
 
 Finally Gaussian noise with standard deviation `mag_unc` is added to produce
-`mag_obs`. Because the BOSZ EMPCA basis and Roman passbands are treated as
-relative shapes, the absolute zeropoint is arbitrary. To make this an AB system,
-the code would need an AB reference convention, e.g. an `f_nu = 3631 Jy`
-reference integral with the same detector weighting used for the source flux.
+`mag_obs`. For real spectrophotometric standard stars with physical
+`f_lambda` values, the same AB count ratio can be used directly; the simulated
+BOSZ stars simply use `mag_norm` to supply the missing absolute normalization.
 
 ### Measurement Table
 
@@ -550,23 +566,23 @@ iteration. The verified iteration summary is:
 
 ```text
 iteration  RMS residual [mag]
-0          0.024675
-1          0.013582
-2          0.008163
-3          0.005772
-4          0.004917
-5          0.004640
+0          0.023675
+1          0.011389
+2          0.007248
+3          0.005395
+4          0.004763
+5          0.004559
 ```
 
 Final default diagnostics:
 
 ```text
-Passband shift RMS error: 0.003896 um
-Passband width RMS error: 0.023643
-Ice log-throughput surface RMS error: 0.042202
-Exposure ZP RMS error: 0.046209 mag
-Smooth coefficient RMS error: 0.001147 mag
-Amp offset RMS error, detector means removed: 0.000932 mag
-Stellar EMPCA coefficient RMS error: 0.093935
-Median formal ice-node uncertainty: 0.008880
+Passband shift RMS error: 0.003720 um
+Passband width RMS error: 0.021345
+Ice log-throughput surface RMS error: 0.035057
+Exposure ZP RMS error: 0.037913 mag
+Smooth coefficient RMS error: 0.001036 mag
+Amp offset RMS error, detector means removed: 0.000905 mag
+Stellar EMPCA coefficient RMS error: 0.086218
+Median formal ice-node uncertainty: 0.008376
 ```
