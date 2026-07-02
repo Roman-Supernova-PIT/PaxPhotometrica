@@ -165,9 +165,10 @@ Amplifier offset RMS error, per-detector means removed: 0.000432 mag
 
 ## Passband And Ice Prototype
 
-This prototype assumes the scalar instrumental calibration above has already
-removed detector/amplifier throughput terms. It simulates flattened stellar
-photometry and fits chromatic calibration parameters.
+This prototype now combines the scalar focal-plane toy model with the chromatic
+passband/ice toy model. It simulates dithered stellar photometry and fits
+stellar SED parameters, scalar exposure/focal-plane/amplifier terms, passband
+shift/width terms, and an ice log-throughput surface.
 
 The broadband flux model is evaluated with linear flux integrals:
 
@@ -188,6 +189,21 @@ ln T_b(lambda, d, x, y, e)
 This lets small multiplicative passband/ice changes enter linearly, while the
 actual synthetic observations and all response coefficients still come from
 linear flux integrals over wavelength.
+
+The measured magnitude also includes scalar focal-plane terms from the
+ubercalibration toy model:
+
+```text
+m_obs = -2.5 log10(F_pred)
+      + ZP_e
+      + S_smooth(x, y)
+      + A_detector,amp
+      + noise
+```
+
+The unified fitter estimates stellar SED parameters, chromatic passband/ice
+parameters, and scalar focal-plane calibration parameters in the same
+linearized iteration.
 
 Notation:
 
@@ -217,6 +233,13 @@ Notation:
   log-throughput response modes derived from `T0_b(lambda)`.
 - `I(log10(lambda), h_obs)`: fitted ice log-throughput perturbation, evaluated
   from a rectangular spline grid in log10 wavelength and ice thickness.
+- `ZP_e`: fitted scalar zeropoint for exposure `e`; exposure 0 is fixed to zero
+  as the reference.
+- `S_smooth(x, y)`: fitted smooth detector-coordinate polynomial with terms
+  `x, y, x^2, x*y, y^2`.
+- `amp`: zero-based amplifier stripe ID computed from detector `x` coordinate.
+- `A_detector,amp`: fitted additive magnitude offset for detector/amplifier
+  pair, with mean amp offset per detector constrained to zero.
 
 ### Files
 
@@ -232,7 +255,7 @@ Notation:
   spline grid. The simulator can read a different node file.
 - `simulate_roman_passband_data.py`: generates six-filter photometry using
   `passbands.txt`, BOSZ EMPCA stellar SEDs, passband modes, a 2D ice spline
-  surface, and truth files.
+  surface, scalar focal-plane terms, and truth files.
 - `fit_roman_passband_model.py`: reads the simulator products and runs an
   iterative sparse linearized fit.
 - `passband_sim_outputs/measurements.csv`: simulated flattened stellar
@@ -252,13 +275,25 @@ Notation:
   the fitter but do not get stellar nuisance-parameter columns.
 - `passband_sim_outputs/true_passband_params.csv`: true detector-level
   passband shift and width coefficients.
-- `passband_fit_outputs/fit_*params.csv`: recovered stellar, passband, and ice
-  parameters.
+- `passband_sim_outputs/true_exposure_zeropoints.csv`: true scalar exposure
+  zeropoints.
+- `passband_sim_outputs/true_smooth_coeffs.csv`: true smooth focal-plane
+  polynomial coefficients.
+- `passband_sim_outputs/true_amp_offsets.csv`: true per-detector/per-amplifier
+  additive magnitude offsets.
+- `passband_fit_outputs/fit_*params.csv`: recovered stellar, passband, ice, and
+  scalar focal-plane parameters.
 - `passband_fit_outputs/fit_star_params.csv`: recovered star magnitude
   normalizations and `sed_coeff_*` EMPCA coefficients, with formal
   `mag_norm` and coefficient sigmas from LSQR when available.
 - `passband_fit_outputs/fit_ice_spline_params.csv`: recovered ice spline node
   values and formal node uncertainties from the final LSQR variance estimate.
+- `passband_fit_outputs/fit_exposure_zeropoints.csv`: recovered scalar
+  exposure zeropoints.
+- `passband_fit_outputs/fit_smooth_coeffs.csv`: recovered smooth focal-plane
+  polynomial coefficients.
+- `passband_fit_outputs/fit_amp_offsets.csv`: recovered per-detector/per-amp
+  offsets.
 - `passband_fit_outputs/fit_iteration_summary.csv`: residual RMS by iteration.
 - `passband_fit_outputs/fit_residuals.csv`: observation table plus final
   residuals.
@@ -290,9 +325,10 @@ Useful simulator options:
 /opt/anaconda3/bin/python simulate_roman_passband_data.py --n-absolute-calibrator 50
 ```
 
-The default simulator uses one detector, six supplied Roman passbands, `2,000`
-stars, `5` fixed absolute calibrator stars, and `30` exposures. The scripts
-are structured so the detector axis can be expanded later.
+The default simulator uses one detector, 32 amplifier stripes, six supplied
+Roman passbands, `2,000` stars, `5` fixed absolute calibrator stars, and `30`
+exposures. The exposure pattern includes translations and rotations, so stars
+move across the smooth focal-plane and amplifier terms.
 
 ### Stellar SED Basis
 
@@ -341,6 +377,7 @@ epoch_id
 filter_id
 filter_name
 detector_id
+amp_id
 x
 y
 ice_thickness
@@ -351,6 +388,10 @@ mag_true_no_noise
 true_sed_mag_nominal
 true_passband_delta_mag
 true_ice_delta_mag
+true_zp_delta_mag
+true_smooth_delta_mag
+true_amp_delta_mag
+true_scalar_delta_mag
 ```
 
 `ice_thickness` is treated as known input to the fitter. `ice_amount_obs` is
@@ -371,6 +412,8 @@ Column meanings:
 - `filter_name`: Roman filter name corresponding to `filter_id`, e.g. `F062`.
 - `detector_id`: one-based detector identifier. The default passband simulation
   uses detector `1`.
+- `amp_id`: zero-based amplifier stripe ID, computed as
+  `floor(x / (nx / n_amp))` and clipped to the available amplifier range.
 - `x`, `y`: detector pixel coordinates for this observation.
 - `ice_thickness`: known ice-thickness coordinate for this observation,
   including exposure/epoch variation and a small position dependence.
@@ -383,6 +426,10 @@ Column meanings:
 - `true_passband_delta_mag`: magnitude difference from detector passband shift
   and width perturbations, before ice is applied.
 - `true_ice_delta_mag`: magnitude difference caused by ice throughput loss.
+- `true_zp_delta_mag`: true scalar exposure zeropoint contribution.
+- `true_smooth_delta_mag`: true smooth focal-plane contribution.
+- `true_amp_delta_mag`: true amplifier offset contribution.
+- `true_scalar_delta_mag`: sum of true zeropoint, smooth, and amp terms.
 
 ### Fitting Method
 
@@ -399,12 +446,16 @@ solve updates for:
 - per-filter/per-detector passband shift,
 - per-filter/per-detector passband width,
 - global ice log-throughput spline node values.
+- per-exposure scalar zeropoints, with exposure 0 fixed to zero,
+- smooth focal-plane polynomial coefficients,
+- per-detector/per-amplifier additive offsets.
 
 The response for each stellar coefficient, passband mode, or ice spline node is
 computed from the current stellar SED and current throughput with the proper
 broadband flux integral. Since the BOSZ coefficients are linear in log SED, the
 stellar coefficient response uses the same flux-weighted integral form as the
-log-throughput response modes. Updates are damped before being applied.
+log-throughput response modes. Scalar zeropoint, smooth, and amp terms are
+linear additive magnitude responses. Updates are damped before being applied.
 
 After the final iteration, the fitter rebuilds the weighted linearized system
 and runs SciPy `lsqr` with `calc_var=True`. This gives a formal diagonal
@@ -426,6 +477,9 @@ pseudo-observation rows for weak priors:
 - stellar EMPCA coefficient update prior:
   `sigma_sed_coeff_update_prior_scale = 0.25` times the empirical standard
   deviation of each BOSZ coefficient in the basis file.
+- amplifier offset prior: `sigma_amp_prior = 0.02 mag`,
+- mean amp offset per detector constraint:
+  `sigma_amp_sum_constraint = 1e-4 mag`.
 
 These priors stabilize the linearized fit but do not remove all degeneracy. The
 diagnostics intentionally show imperfect passband and stellar-parameter
@@ -447,26 +501,29 @@ log-throughput perturbation.
 
 ### Default Verification
 
-A default run currently produces `55,030` observations, uses `5` fixed
-absolute calibrator stars, and solves `10,032` linearized update parameters per
+A default run currently produces `44,638` observations, uses `5` fixed
+absolute calibrator stars, and solves `10,098` linearized update parameters per
 iteration. The verified iteration summary is:
 
 ```text
 iteration  RMS residual [mag]
-0          0.024462
-1          0.011003
-2          0.006775
-3          0.005197
-4          0.004707
-5          0.004571
+0          0.024675
+1          0.013582
+2          0.008163
+3          0.005772
+4          0.004917
+5          0.004640
 ```
 
 Final default diagnostics:
 
 ```text
-Passband shift RMS error: 0.000257 um
-Passband width RMS error: 0.003352
-Ice log-throughput surface RMS error: 0.012734
-Stellar EMPCA coefficient RMS error: 0.069927
-Median formal ice-node uncertainty: 0.005874
+Passband shift RMS error: 0.003896 um
+Passband width RMS error: 0.023643
+Ice log-throughput surface RMS error: 0.042202
+Exposure ZP RMS error: 0.046209 mag
+Smooth coefficient RMS error: 0.001147 mag
+Amp offset RMS error, detector means removed: 0.000932 mag
+Stellar EMPCA coefficient RMS error: 0.093935
+Median formal ice-node uncertainty: 0.008880
 ```

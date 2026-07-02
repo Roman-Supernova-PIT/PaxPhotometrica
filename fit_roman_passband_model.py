@@ -106,6 +106,11 @@ class FitConfig:
     sigma_ice_prior: float = 0.10
     sigma_zero_ice_surface_prior: float = 1e-4
     sigma_sed_coeff_update_prior_scale: float = 0.25
+    sigma_amp_prior: float = 0.02
+    sigma_amp_sum_constraint: float = 1e-4
+    nx: int = 4096
+    ny: int = 4096
+    n_amp: int = 32
     chunk_size: int = 512
     random_seed: int = 12345
 
@@ -118,9 +123,11 @@ class DataBundle:
     filter_names: list[str]
     detector_ids: np.ndarray
     star_ids: np.ndarray
+    exposure_id: np.ndarray
     filter_param_id: np.ndarray
     detector_param_id: np.ndarray
     star_param_id: np.ndarray
+    amp_id: np.ndarray
     star_is_calibrator: np.ndarray
     free_star_indices: np.ndarray
     free_star_index: np.ndarray
@@ -136,6 +143,9 @@ class DataBundle:
     true_star_params: pd.DataFrame | None
     true_passband_params: pd.DataFrame | None
     true_ice_spline_params: pd.DataFrame | None
+    true_exposure_zeropoints: pd.DataFrame | None
+    true_smooth_coeffs: pd.DataFrame | None
+    true_amp_offsets: pd.DataFrame | None
     sim_metadata: dict
 
 
@@ -146,6 +156,9 @@ class ModelState:
     shift: np.ndarray
     width: np.ndarray
     ice_coeff: np.ndarray
+    zp: np.ndarray
+    smooth_coeff: np.ndarray
+    amp_offset: np.ndarray
 
 
 @dataclass
@@ -163,6 +176,29 @@ def trapz_integral(y: np.ndarray, wave: np.ndarray, axis: int = -1) -> np.ndarra
     if hasattr(np, "trapezoid"):
         return np.trapezoid(y, wave, axis=axis)
     return np.trapz(y, wave, axis=axis)
+
+
+def amp_id_from_x(x: np.ndarray, nx: int = 4096, n_amp: int = 32) -> np.ndarray:
+    """Return amplifier stripe id for detector x pixel coordinate."""
+    amp_width = nx // n_amp
+    amp_id = np.floor(np.asarray(x) / amp_width).astype(int)
+    return np.clip(amp_id, 0, n_amp - 1)
+
+
+def normalized_xy(
+    x: np.ndarray, y: np.ndarray, nx: int = 4096, ny: int = 4096
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map detector pixels to [-1, 1] normalized coordinates."""
+    xn = 2.0 * (x / (nx - 1.0)) - 1.0
+    yn = 2.0 * (y / (ny - 1.0)) - 1.0
+    return xn, yn
+
+
+def poly_basis(xn: np.ndarray, yn: np.ndarray) -> np.ndarray:
+    """Smooth star-flat polynomial terms: x, y, x^2, x*y, y^2."""
+    xn = np.asarray(xn)
+    yn = np.asarray(yn)
+    return np.column_stack((xn, yn, xn**2, xn * yn, yn**2))
 
 
 def flux_to_mag(flux: np.ndarray) -> np.ndarray:
@@ -280,6 +316,9 @@ def load_data(config: FitConfig) -> DataBundle:
     if metadata_path.exists():
         with open(metadata_path, "r", encoding="utf-8") as handle:
             sim_metadata = json.load(handle)
+    for key in ("nx", "ny", "n_amp"):
+        if key in sim_metadata:
+            setattr(config, key, int(sim_metadata[key]))
     sed_basis_path = resolve_sed_basis_path(config, sim_metadata, input_dir)
     config.sed_basis_path = str(sed_basis_path)
     sed_library = BOSZEMPCASEDLibrary(sed_basis_path).resampled_to(wave)
@@ -292,10 +331,15 @@ def load_data(config: FitConfig) -> DataBundle:
     filter_ids = np.sort(measurements["filter_id"].unique())
     detector_ids = np.sort(measurements["detector_id"].unique())
     star_ids, star_param_id = np.unique(measurements["star_id"].to_numpy(int), return_inverse=True)
+    exposure_id = measurements["exposure_id"].to_numpy(int)
     filter_lookup = {value: i for i, value in enumerate(filter_ids)}
     detector_lookup = {value: i for i, value in enumerate(detector_ids)}
     filter_param_id = measurements["filter_id"].map(filter_lookup).to_numpy(int)
     detector_param_id = measurements["detector_id"].map(detector_lookup).to_numpy(int)
+    if "amp_id" in measurements.columns:
+        amp_id = measurements["amp_id"].to_numpy(int)
+    else:
+        amp_id = amp_id_from_x(measurements["x"].to_numpy(float), nx=config.nx, n_amp=config.n_amp)
 
     all_pass_filter_ids = pass_data["filter_ids"]
     pass_lookup = {value: i for i, value in enumerate(all_pass_filter_ids)}
@@ -355,9 +399,11 @@ def load_data(config: FitConfig) -> DataBundle:
         filter_names=filter_names,
         detector_ids=detector_ids,
         star_ids=star_ids,
+        exposure_id=exposure_id,
         filter_param_id=filter_param_id,
         detector_param_id=detector_param_id,
         star_param_id=star_param_id,
+        amp_id=amp_id,
         star_is_calibrator=star_is_calibrator,
         free_star_indices=free_star_indices,
         free_star_index=free_star_index,
@@ -373,6 +419,9 @@ def load_data(config: FitConfig) -> DataBundle:
         true_star_params=read_optional("true_star_params.csv"),
         true_passband_params=read_optional("true_passband_params.csv"),
         true_ice_spline_params=read_optional("true_ice_spline_params.csv"),
+        true_exposure_zeropoints=read_optional("true_exposure_zeropoints.csv"),
+        true_smooth_coeffs=read_optional("true_smooth_coeffs.csv"),
+        true_amp_offsets=read_optional("true_amp_offsets.csv"),
         sim_metadata=sim_metadata,
     )
 
@@ -433,7 +482,11 @@ def fit_initial_stellar_seds(data: DataBundle) -> ModelState:
     shift = np.zeros((data.filter_ids.size, data.detector_ids.size))
     width = np.zeros_like(shift)
     ice_coeff = np.zeros(data.ice_thickness_nodes.size * data.ice_loglam_nodes.size)
-    return ModelState(mag_norm, sed_coeff, shift, width, ice_coeff)
+    n_exp = int(data.exposure_id.max()) + 1
+    zp = np.zeros(n_exp)
+    smooth_coeff = np.zeros(5)
+    amp_offset = np.zeros((data.detector_ids.size, int(data.sim_metadata.get("n_amp", 32))))
+    return ModelState(mag_norm, sed_coeff, shift, width, ice_coeff, zp, smooth_coeff, amp_offset)
 
 
 def evaluate_model_and_responses(
@@ -458,6 +511,8 @@ def evaluate_model_and_responses(
         ice_thickness = data.measurements["ice_thickness"].to_numpy(float)
     else:
         ice_thickness = data.measurements["ice_amount_obs"].to_numpy(float)
+    x_pix = data.measurements["x"].to_numpy(float)
+    y_pix = data.measurements["y"].to_numpy(float)
 
     for start in range(0, n_obs, config.chunk_size):
         end = min(n_obs, start + config.chunk_size)
@@ -465,6 +520,8 @@ def evaluate_model_and_responses(
         star = data.star_param_id[sl]
         filt = data.filter_param_id[sl]
         det = data.detector_param_id[sl]
+        exp_id = data.exposure_id[sl]
+        amp = data.amp_id[sl]
         ice = ice_thickness[sl]
 
         sed = data.sed_library.sed_from_coefficients(
@@ -484,7 +541,10 @@ def evaluate_model_and_responses(
         t_current = data.passbands[filt] * np.exp(logt)
         weighted = sed * t_current
         denom = trapz_integral(weighted, data.wave, axis=1)
-        mag_model[sl] = flux_to_mag(denom)
+        xn, yn = normalized_xy(x_pix[sl], y_pix[sl], nx=config.nx, ny=config.ny)
+        smooth = poly_basis(xn, yn) @ state.smooth_coeff
+        scalar = state.zp[exp_id] + smooth + state.amp_offset[det, amp]
+        mag_model[sl] = flux_to_mag(denom) + scalar
 
         if not need_responses:
             continue
@@ -540,6 +600,9 @@ def parameter_slices(data: DataBundle) -> dict[str, slice]:
     n_sed = n_free_star * data.sed_library.n_components
     n_pass = data.filter_ids.size * data.detector_ids.size
     n_ice = data.ice_thickness_nodes.size * data.ice_loglam_nodes.size
+    n_zp = max(int(data.exposure_id.max()), 0)
+    n_smooth = 5
+    n_amp = data.detector_ids.size * int(data.sim_metadata.get("n_amp", 32))
     start = 0
     slices = {}
     slices["norm"] = slice(start, start + n_free_star)
@@ -551,6 +614,12 @@ def parameter_slices(data: DataBundle) -> dict[str, slice]:
     slices["width"] = slice(start, start + n_pass)
     start += n_pass
     slices["ice"] = slice(start, start + n_ice)
+    start += n_ice
+    slices["zp"] = slice(start, start + n_zp)
+    start += n_zp
+    slices["smooth"] = slice(start, start + n_smooth)
+    start += n_smooth
+    slices["amp"] = slice(start, start + n_amp)
     return slices
 
 
@@ -559,7 +628,7 @@ def build_sparse_system(
 ) -> tuple[coo_matrix, np.ndarray, dict[str, slice]]:
     """Build weighted sparse system for one linearized update."""
     slices = parameter_slices(data)
-    n_params = slices["ice"].stop
+    n_params = slices["amp"].stop
     n_components = data.sed_library.n_components
     rows = []
     cols = []
@@ -570,6 +639,10 @@ def build_sparse_system(
     obs_mag = data.measurements["mag_obs"].to_numpy(float)
     obs_unc = data.measurements["mag_unc"].to_numpy(float)
     residual = obs_mag - lin.mag_model
+    x_pix = data.measurements["x"].to_numpy(float)
+    y_pix = data.measurements["y"].to_numpy(float)
+    xn, yn = normalized_xy(x_pix, y_pix, nx=config.nx, ny=config.ny)
+    smooth_basis = poly_basis(xn, yn)
 
     n_det = data.detector_ids.size
     for obs_index in range(len(data.measurements)):
@@ -579,6 +652,7 @@ def build_sparse_system(
         det = data.detector_param_id[obs_index]
         pass_index = filt * n_det + det
         free_star = data.free_star_index[star]
+        exp_id = data.exposure_id[obs_index]
 
         entries = [
             (slices["shift"].start + pass_index, lin.r_shift[obs_index]),
@@ -596,6 +670,12 @@ def build_sparse_system(
                 )
         for basis_id in range(data.ice_thickness_nodes.size * data.ice_loglam_nodes.size):
             entries.append((slices["ice"].start + basis_id, lin.r_ice[obs_index, basis_id]))
+        if exp_id != 0:
+            entries.append((slices["zp"].start + exp_id - 1, 1.0))
+        for smooth_id in range(5):
+            entries.append((slices["smooth"].start + smooth_id, smooth_basis[obs_index, smooth_id]))
+        amp_index = det * config.n_amp + data.amp_id[obs_index]
+        entries.append((slices["amp"].start + amp_index, 1.0))
 
         for col, value in entries:
             rows.append(row)
@@ -654,6 +734,23 @@ def build_sparse_system(
             rhs.append(0.0)
             row += 1
 
+    for flat_index, current in enumerate(state.amp_offset.ravel()):
+        rows.append(row)
+        cols.append(slices["amp"].start + flat_index)
+        vals.append(1.0 / config.sigma_amp_prior)
+        rhs.append(-current / config.sigma_amp_prior)
+        row += 1
+
+    for det_id in range(n_det):
+        for amp_id in range(config.n_amp):
+            flat_index = det_id * config.n_amp + amp_id
+            rows.append(row)
+            cols.append(slices["amp"].start + flat_index)
+            vals.append((1.0 / config.n_amp) / config.sigma_amp_sum_constraint)
+        current_mean = state.amp_offset[det_id].mean()
+        rhs.append(-current_mean / config.sigma_amp_sum_constraint)
+        row += 1
+
     A = coo_matrix((vals, (rows, cols)), shape=(row, n_params)).tocsr()
     return A, np.asarray(rhs), slices
 
@@ -674,6 +771,9 @@ def apply_update(
     state.shift += damping * theta[slices["shift"]].reshape(n_filter, n_det)
     state.width += damping * theta[slices["width"]].reshape(n_filter, n_det)
     state.ice_coeff += damping * theta[slices["ice"]]
+    state.zp[1:] += damping * theta[slices["zp"]]
+    state.smooth_coeff += damping * theta[slices["smooth"]]
+    state.amp_offset += damping * theta[slices["amp"]].reshape(n_det, config.n_amp)
 
 
 def rms(values: np.ndarray) -> float:
@@ -875,6 +975,36 @@ def save_outputs(
                 pass_rows[-1]["width_sigma"] = param_sigma[slices["width"].start + pass_index]
     pd.DataFrame(pass_rows).to_csv(output_dir / "fit_passband_params.csv", index=False)
 
+    zp_rows = []
+    for exp_id, zp_value in enumerate(state.zp):
+        row = {"exposure_id": exp_id, "zp_mag": zp_value}
+        if param_sigma is not None and slices is not None:
+            row["zp_mag_sigma"] = 0.0 if exp_id == 0 else param_sigma[slices["zp"].start + exp_id - 1]
+        zp_rows.append(row)
+    pd.DataFrame(zp_rows).to_csv(output_dir / "fit_exposure_zeropoints.csv", index=False)
+
+    smooth_rows = []
+    for smooth_id, name in enumerate(["x", "y", "x2", "xy", "y2"]):
+        row = {"basis_name": name, "coefficient_mag": state.smooth_coeff[smooth_id]}
+        if param_sigma is not None and slices is not None:
+            row["coefficient_mag_sigma"] = param_sigma[slices["smooth"].start + smooth_id]
+        smooth_rows.append(row)
+    pd.DataFrame(smooth_rows).to_csv(output_dir / "fit_smooth_coeffs.csv", index=False)
+
+    amp_rows = []
+    for det_i, det in enumerate(data.detector_ids):
+        for amp_id in range(config.n_amp):
+            index = det_i * config.n_amp + amp_id
+            row = {
+                "detector_id": det,
+                "amp_id": amp_id,
+                "amp_offset_mag": state.amp_offset[det_i, amp_id],
+            }
+            if param_sigma is not None and slices is not None:
+                row["amp_offset_mag_sigma"] = param_sigma[slices["amp"].start + index]
+            amp_rows.append(row)
+    pd.DataFrame(amp_rows).to_csv(output_dir / "fit_amp_offsets.csv", index=False)
+
     ice_rows = []
     n_loglam = data.ice_loglam_nodes.size
     for thick_id, thickness in enumerate(data.ice_thickness_nodes):
@@ -933,6 +1063,8 @@ def print_diagnostics(
     n_params = (1 + data.sed_library.n_components) * data.free_star_indices.size
     n_params += 2 * data.filter_ids.size * data.detector_ids.size
     n_params += data.ice_thickness_nodes.size * data.ice_loglam_nodes.size
+    n_amp = int(data.sim_metadata.get("n_amp", 32))
+    n_params += max(int(data.exposure_id.max()), 0) + 5 + data.detector_ids.size * n_amp
     print(f"Number of fitted linearized parameters per iteration: {n_params}")
     print(f"Initial RMS residual: {summary.iloc[0]['rms_residual']:.6f} mag")
     print(f"Final RMS residual: {rms(final_resid):.6f} mag")
@@ -955,6 +1087,27 @@ def print_diagnostics(
         _, _, true_surface = ice_surface_on_grid(data, true_ice)
         _, _, fit_surface = ice_surface_on_grid(data, state.ice_coeff)
         print(f"Ice log-throughput surface RMS error: {rms(fit_surface - true_surface):.6f}")
+    if data.true_exposure_zeropoints is not None:
+        true_zp = np.zeros_like(state.zp)
+        for _, row in data.true_exposure_zeropoints.iterrows():
+            exp_id = int(row["exposure_id"])
+            if 0 <= exp_id < true_zp.size:
+                true_zp[exp_id] = row["zp_mag"]
+        print(f"Exposure ZP RMS error: {rms(state.zp - true_zp):.6f} mag")
+    if data.true_smooth_coeffs is not None:
+        true_smooth = data.true_smooth_coeffs["coefficient_mag"].to_numpy(float)
+        if true_smooth.size == state.smooth_coeff.size:
+            print(f"Smooth coefficient RMS error: {rms(state.smooth_coeff - true_smooth):.6f} mag")
+    if data.true_amp_offsets is not None:
+        true_amp = np.zeros_like(state.amp_offset)
+        for _, row in data.true_amp_offsets.iterrows():
+            det_matches = np.nonzero(data.detector_ids == int(row["detector_id"]))[0]
+            amp_id = int(row["amp_id"])
+            if det_matches.size and 0 <= amp_id < n_amp:
+                true_amp[det_matches[0], amp_id] = row["amp_offset_mag"]
+        fit_centered = state.amp_offset - state.amp_offset.mean(axis=1, keepdims=True)
+        true_centered = true_amp - true_amp.mean(axis=1, keepdims=True)
+        print(f"Amp offset RMS error, detector means removed: {rms(fit_centered - true_centered):.6f} mag")
     if data.true_star_params is not None:
         coeff_cols = [f"sed_coeff_{i}" for i in range(data.sed_library.n_components)]
         if all(col in data.true_star_params.columns for col in coeff_cols):

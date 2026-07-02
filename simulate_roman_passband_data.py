@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Simulate Roman-like WFI passband and ice calibration photometry.
+"""Simulate Roman-like WFI scalar and chromatic calibration photometry.
 
-This simulator assumes scalar instrumental calibration has already been applied.
-It focuses on chromatic calibration: small passband shifts, passband width
-changes, and ice-induced wavelength/thickness-dependent throughput changes.
+This simulator combines the scalar ubercalibration toy model with chromatic
+calibration: exposure zeropoints, smooth focal-plane terms, amplifier offsets,
+small passband shifts, passband width changes, and ice-induced
+wavelength/thickness-dependent throughput changes.
 
 Throughput perturbations are modeled in log-throughput space because small
 multiplicative throughput changes then add linearly. Observations are still
@@ -19,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from typing import Tuple
 
 _MPL_CACHE = Path(tempfile.gettempdir()) / "roman_passband_mpl_cache"
 _MPL_CACHE.mkdir(parents=True, exist_ok=True)
@@ -39,6 +41,7 @@ class SimConfig:
     n_det: int = 1
     nx: int = 4096
     ny: int = 4096
+    n_amp: int = 32
     n_filter: int = 6
     n_absolute_calibrator: int = 5
     wave_min: float = 0.45
@@ -53,11 +56,22 @@ class SimConfig:
     phot_sigma_mag: float = 0.005
     output_dir: str = "passband_sim_outputs"
     detection_fraction: float = 0.92
+    dither_sigma_pix: float = 500.0
+    zp_sigma_mag: float = 0.01
+    amp_sigma_mag: float = 0.003
     shift_sigma_um: float = 0.001
     width_sigma: float = 0.01
     mode_smooth_sigma_pix: float = 4.0
     max_abs_phi_shift: float = 250.0
     max_abs_phi_width: float = 80.0
+    rotation_angles_deg: Tuple[float, ...] = (0.0, -5.0, 5.0)
+    true_smooth_coeffs: Tuple[float, float, float, float, float] = (
+        0.0040,
+        -0.0030,
+        0.0060,
+        -0.0020,
+        -0.0040,
+    )
 
 
 class BOSZEMPCASEDLibrary:
@@ -120,6 +134,51 @@ def trapz_integral(y: np.ndarray, wave: np.ndarray, axis: int = -1) -> np.ndarra
     if hasattr(np, "trapezoid"):
         return np.trapezoid(y, wave, axis=axis)
     return np.trapz(y, wave, axis=axis)
+
+
+def amp_id_from_x(x: np.ndarray, nx: int = 4096, n_amp: int = 32) -> np.ndarray:
+    """Return amplifier stripe id for detector x pixel coordinate."""
+    amp_width = nx // n_amp
+    amp_id = np.floor(np.asarray(x) / amp_width).astype(int)
+    return np.clip(amp_id, 0, n_amp - 1)
+
+
+def normalized_xy(x: np.ndarray, y: np.ndarray, config: SimConfig) -> tuple[np.ndarray, np.ndarray]:
+    """Map detector pixels to [-1, 1] normalized coordinates."""
+    xn = 2.0 * (x / (config.nx - 1.0)) - 1.0
+    yn = 2.0 * (y / (config.ny - 1.0)) - 1.0
+    return xn, yn
+
+
+def poly_basis(xn: np.ndarray, yn: np.ndarray) -> np.ndarray:
+    """Smooth star-flat polynomial terms: x, y, x^2, x*y, y^2."""
+    xn = np.asarray(xn)
+    yn = np.asarray(yn)
+    return np.column_stack((xn, yn, xn**2, xn * yn, yn**2))
+
+
+def exposure_rotation_sequence(config: SimConfig) -> np.ndarray:
+    """Create a deterministic sequence with at least two rotation angles."""
+    angles = np.asarray(config.rotation_angles_deg, dtype=float)
+    if angles.size < 2:
+        raise ValueError("rotation_angles_deg must contain at least two angles")
+    return angles[np.arange(config.n_exp) % angles.size]
+
+
+def apply_exposure_transform(
+    x0: np.ndarray, y0: np.ndarray, dx: float, dy: float, rotation_deg: float, config: SimConfig
+) -> tuple[np.ndarray, np.ndarray]:
+    """Rotate positions about detector center, then apply translational dither."""
+    cx = 0.5 * (config.nx - 1.0)
+    cy = 0.5 * (config.ny - 1.0)
+    theta = np.deg2rad(rotation_deg)
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+    x_centered = x0 - cx
+    y_centered = y0 - cy
+    x = cx + cos_t * x_centered - sin_t * y_centered + dx
+    y = cy + sin_t * x_centered + cos_t * y_centered + dy
+    return x, y
 
 
 def make_wavelength_grid(config: SimConfig) -> np.ndarray:
@@ -395,8 +454,8 @@ def simulate_data(config: SimConfig) -> None:
     star_detector_index = np.arange(config.n_star, dtype=int) % config.n_det
     rng.shuffle(star_detector_index)
     star_detector_id = detector_ids[star_detector_index]
-    star_x = rng.uniform(0.0, config.nx, size=config.n_star)
-    star_y = rng.uniform(0.0, config.ny, size=config.n_star)
+    star_base_x = rng.uniform(0.0, config.nx, size=config.n_star)
+    star_base_y = rng.uniform(0.0, config.ny, size=config.n_star)
 
     true_mag_norm = rng.uniform(18.0, 22.0, size=config.n_star)
     true_model_index = rng.integers(sed_library.coefficients.shape[0], size=config.n_star)
@@ -414,8 +473,8 @@ def simulate_data(config: SimConfig) -> None:
     star_param_payload = {
         "star_id": np.arange(config.n_star, dtype=int),
         "detector_id": star_detector_id,
-        "x": star_x,
-        "y": star_y,
+        "x": star_base_x,
+        "y": star_base_y,
         "mag_norm": true_mag_norm,
         "is_absolute_calibrator": is_calibrator,
         "bosz_model_index": true_model_index,
@@ -441,10 +500,45 @@ def simulate_data(config: SimConfig) -> None:
             )
     pd.DataFrame(pass_rows).to_csv(output_dir / "true_passband_params.csv", index=False)
 
+    true_zp = rng.normal(0.0, config.zp_sigma_mag, size=config.n_exp)
+    true_zp[0] = 0.0
+    true_smooth_coeffs = np.asarray(config.true_smooth_coeffs, dtype=float)
+    true_amp_offsets = rng.normal(
+        0.0, config.amp_sigma_mag, size=(config.n_det, config.n_amp)
+    )
+    true_amp_offsets -= true_amp_offsets.mean(axis=1, keepdims=True)
+
+    pd.DataFrame(
+        {"exposure_id": np.arange(config.n_exp, dtype=int), "zp_mag": true_zp}
+    ).to_csv(output_dir / "true_exposure_zeropoints.csv", index=False)
+    pd.DataFrame(
+        {
+            "basis_name": ["x", "y", "x2", "xy", "y2"],
+            "coefficient_mag": true_smooth_coeffs,
+        }
+    ).to_csv(output_dir / "true_smooth_coeffs.csv", index=False)
+    amp_rows = []
+    for det_index, det_id in enumerate(detector_ids):
+        for amp_id in range(config.n_amp):
+            amp_rows.append(
+                {
+                    "detector_id": det_id,
+                    "amp_id": amp_id,
+                    "amp_offset_mag": true_amp_offsets[det_index, amp_id],
+                }
+            )
+    pd.DataFrame(amp_rows).to_csv(output_dir / "true_amp_offsets.csv", index=False)
+
     # One exposure uses one filter. The known ice amount has an epoch component
     # plus a weak detector-position component, resembling an RCS-derived scalar.
     exposure_filter = np.arange(config.n_exp, dtype=int) % config.n_filter
     epoch_id = np.arange(config.n_exp, dtype=int)
+    dither_dx = rng.normal(0.0, config.dither_sigma_pix, size=config.n_exp)
+    dither_dy = rng.normal(0.0, config.dither_sigma_pix, size=config.n_exp)
+    dither_dx[0] = 0.0
+    dither_dy[0] = 0.0
+    rotation_deg = exposure_rotation_sequence(config)
+    rotation_deg[0] = 0.0
     slow_phase = np.linspace(0.0, 2.0 * np.pi, config.n_exp)
     exposure_ice = 0.55 + 0.35 * np.sin(slow_phase) + rng.normal(0.0, 0.07, config.n_exp)
     exposure_ice = np.clip(exposure_ice, 0.02, 1.20)
@@ -455,14 +549,33 @@ def simulate_data(config: SimConfig) -> None:
     obs_id = 0
     for exp_id in range(config.n_exp):
         filt = exposure_filter[exp_id]
-        keep = rng.random(config.n_star) < config.detection_fraction
+        x_exp, y_exp = apply_exposure_transform(
+            star_base_x,
+            star_base_y,
+            dither_dx[exp_id],
+            dither_dy[exp_id],
+            rotation_deg[exp_id],
+            config,
+        )
+        in_bounds = (
+            (x_exp >= 0.0)
+            & (x_exp < config.nx)
+            & (y_exp >= 0.0)
+            & (y_exp < config.ny)
+        )
+        keep = (rng.random(config.n_star) < config.detection_fraction) & in_bounds
         star_indices = np.nonzero(keep)[0]
 
         for star_id in star_indices:
             det_index = star_detector_index[star_id]
             det_id = star_detector_id[star_id]
-            x = star_x[star_id]
-            y = star_y[star_id]
+            x = x_exp[star_id]
+            y = y_exp[star_id]
+            amp_id = int(amp_id_from_x(x, nx=config.nx, n_amp=config.n_amp))
+            xn, yn = normalized_xy(np.asarray([x]), np.asarray([y]), config)
+            smooth_delta = float((poly_basis(xn, yn) @ true_smooth_coeffs)[0])
+            amp_delta = true_amp_offsets[det_index, amp_id]
+            scalar_delta = true_zp[exp_id] + smooth_delta + amp_delta
             position_term = 1.0 + 0.12 * (x / (config.nx - 1.0) - 0.5)
             position_term += 0.08 * (y / (config.ny - 1.0) - 0.5)
             ice_thickness = np.clip(
@@ -489,7 +602,8 @@ def simulate_data(config: SimConfig) -> None:
             flux_true = trapz_integral(sed * t_true, wave)
             mag_nominal = flux_to_mag(flux_nominal)
             mag_pass = flux_to_mag(flux_pass)
-            mag_true = flux_to_mag(flux_true)
+            mag_chromatic = flux_to_mag(flux_true)
+            mag_true = mag_chromatic + scalar_delta
             mag_obs = mag_true + rng.normal(0.0, config.phot_sigma_mag)
 
             rows.append(
@@ -501,6 +615,7 @@ def simulate_data(config: SimConfig) -> None:
                     "filter_id": filt,
                     "filter_name": filter_names[filt],
                     "detector_id": det_id,
+                    "amp_id": amp_id,
                     "x": x,
                     "y": y,
                     "ice_thickness": ice_thickness,
@@ -510,7 +625,11 @@ def simulate_data(config: SimConfig) -> None:
                     "mag_true_no_noise": mag_true,
                     "true_sed_mag_nominal": mag_nominal,
                     "true_passband_delta_mag": mag_pass - mag_nominal,
-                    "true_ice_delta_mag": mag_true - mag_pass,
+                    "true_ice_delta_mag": mag_chromatic - mag_pass,
+                    "true_zp_delta_mag": true_zp[exp_id],
+                    "true_smooth_delta_mag": smooth_delta,
+                    "true_amp_delta_mag": amp_delta,
+                    "true_scalar_delta_mag": scalar_delta,
                 }
             )
             obs_id += 1
