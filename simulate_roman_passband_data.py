@@ -42,7 +42,7 @@ AB_FNU_CGS = 3631.0e-23  # erg / s / cm^2 / Hz
 class SimConfig:
     random_seed: int = 12345
     n_star: int = 2000
-    n_exp: int = 30
+    n_exp: int = 60
     n_det: int = 1
     nx: int = 4096
     ny: int = 4096
