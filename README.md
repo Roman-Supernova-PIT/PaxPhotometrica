@@ -258,6 +258,9 @@ Notation:
   surface, scalar focal-plane terms, and truth files.
 - `fit_roman_passband_model.py`: reads the simulator products and runs an
   iterative sparse linearized fit.
+- `query_calibration.py`: reads the saved simulator/fitter products and queries
+  fitted AB zeropoints plus sampled passband curves for new instrumental
+  photometry.
 - `passband_sim_outputs/measurements.csv`: simulated flattened stellar
   photometry.
 - `passband_sim_outputs/nominal_passbands.csv`: long-form nominal passbands.
@@ -323,6 +326,42 @@ Useful fitter options:
 /opt/anaconda3/bin/python fit_roman_passband_model.py --sed-basis-path bosz_logflux_empca_basis.npz
 ```
 
+Query a fitted calibration for one instrumental measurement:
+
+```bash
+/opt/anaconda3/bin/python query_calibration.py \
+  --filter-name F129 \
+  --detector-id 1 \
+  --exposure-id 2 \
+  --x 1024 \
+  --y 2048 \
+  --ice-thickness 0.3 \
+  --instrumental-mag 19.5
+```
+
+This writes `calibration_query_results.csv` with `fit_ab_zeropoint_mag` and
+`calibrated_ab_mag`, plus `calibration_query_passbands.csv` with the sampled
+current passband:
+
+```text
+T_current(lambda)
+  = T0(lambda) * exp(logt_passband(lambda) + ice_logt(lambda, ice_thickness))
+```
+
+For a batch table, provide columns `filter_id` or `filter_name`, `detector_id`,
+`exposure_id`, `x`, `y`, and `ice_thickness`. If `amp_id` is absent, it is
+computed from `x`; if `instrumental_mag`, `mag_inst`, or `mag_obs` is present,
+the script also writes `calibrated_ab_mag`.
+
+```bash
+/opt/anaconda3/bin/python query_calibration.py \
+  --query-csv my_instrumental_measurements.csv \
+  --output-csv my_calibrated_measurements.csv \
+  --passband-output-csv my_current_passbands.csv
+```
+
+Use `--no-passband-output` for a faster zeropoint-only batch query.
+
 Useful simulator options:
 
 ```bash
@@ -331,7 +370,7 @@ Useful simulator options:
 /opt/anaconda3/bin/python simulate_roman_passband_data.py --ice-thickness-min 0.0 --ice-thickness-max 1.5
 /opt/anaconda3/bin/python simulate_roman_passband_data.py --sed-basis-path bosz_logflux_empca_basis.npz
 /opt/anaconda3/bin/python simulate_roman_passband_data.py --reference-filter-id 3
-/opt/anaconda3/bin/python simulate_roman_passband_data.py --n-absolute-calibrator 50
+/opt/anaconda3/bin/python simulate_roman_passband_data.py --n-absolute-calibrator 5
 ```
 
 The default simulator uses one detector, 32 amplifier stripes, six supplied
