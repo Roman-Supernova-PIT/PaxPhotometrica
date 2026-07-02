@@ -297,7 +297,12 @@ Notation:
 - `passband_fit_outputs/fit_iteration_summary.csv`: residual RMS by iteration.
 - `passband_fit_outputs/fit_residuals.csv`: observation table plus final
   residuals.
-- `passband_fit_outputs/*.png`: diagnostic plots.
+- `passband_fit_outputs/*.png`: diagnostic plots, including the passband/ice
+  recovery plots plus scalar focal-plane plots such as
+  `smooth_field_true.png`, `smooth_field_recovered.png`,
+  `smooth_field_residual.png`, `true_amp_offsets.png`,
+  `recovered_amp_offsets.png`, `amp_offset_comparison.png`,
+  `residual_vs_x.png`, and `residual_vs_amp.png`.
 
 ### Run
 
@@ -364,6 +369,44 @@ calibrators. For those stars, `mag_norm` and all `sed_coeff_*` values are
 assumed known exactly by this prototype. The fitter uses their fixed SEDs in
 the forward model and omits their stellar normalization/coefficient update
 columns from the sparse least-squares system.
+
+### Synthetic Photometry And Magnitudes
+
+The prototype uses instrumental/model magnitudes, not calibrated AB magnitudes.
+The synthetic broadband flux for one observation is computed on the passband
+wavelength grid as
+
+```text
+F = integral sed_shape_s(lambda)
+             * 10^(-0.4 mag_norm_s)
+             * T0_b(lambda)
+             * exp(logT_passband + logT_ice)
+             d lambda
+```
+
+where `sed_shape_s(lambda) = exp(mean_log_flux + theta_s @ components)` and
+`T0_b(lambda)` is the relative throughput from `passbands.txt`. The simulator
+uses `np.trapezoid`/`np.trapz` for this integral. The current toy integral does
+not include a photon-counting `lambda / hc` factor, a filter-normalization
+denominator, or a physical reference spectrum.
+
+Flux is converted to magnitude with
+
+```text
+m_chromatic = -2.5 log10(F)
+```
+
+and then the scalar calibration terms are added:
+
+```text
+m_true = m_chromatic + ZP_e + S_smooth(x, y) + A_detector,amp
+```
+
+Finally Gaussian noise with standard deviation `mag_unc` is added to produce
+`mag_obs`. Because the BOSZ EMPCA basis and Roman passbands are treated as
+relative shapes, the absolute zeropoint is arbitrary. To make this an AB system,
+the code would need an AB reference convention, e.g. an `f_nu = 3631 Jy`
+reference integral with the same detector weighting used for the source flux.
 
 ### Measurement Table
 

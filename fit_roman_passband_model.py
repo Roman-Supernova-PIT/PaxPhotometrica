@@ -780,6 +780,36 @@ def rms(values: np.ndarray) -> float:
     return float(np.sqrt(np.mean(values**2)))
 
 
+def evaluate_smooth_field(
+    coeffs: np.ndarray, x: np.ndarray, y: np.ndarray, config: FitConfig
+) -> np.ndarray:
+    """Evaluate the smooth focal-plane polynomial at detector pixel positions."""
+    xn, yn = normalized_xy(np.asarray(x), np.asarray(y), nx=config.nx, ny=config.ny)
+    flat_xn = np.ravel(xn)
+    flat_yn = np.ravel(yn)
+    values = poly_basis(flat_xn, flat_yn) @ coeffs
+    return values.reshape(np.shape(xn))
+
+
+def smooth_fields_on_grid(
+    data: DataBundle, state: ModelState, config: FitConfig, n_grid: int = 120
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Evaluate true, fitted, and residual smooth fields on a detector grid."""
+    if data.true_smooth_coeffs is None:
+        return None
+    true_coeff = data.true_smooth_coeffs["coefficient_mag"].to_numpy(float)
+    if true_coeff.size != state.smooth_coeff.size:
+        return None
+    x_grid = np.linspace(0.0, config.nx - 1.0, n_grid)
+    y_grid = np.linspace(0.0, config.ny - 1.0, n_grid)
+    xx, yy = np.meshgrid(x_grid, y_grid)
+    true_field = evaluate_smooth_field(true_coeff, xx, yy, config)
+    fit_field = evaluate_smooth_field(state.smooth_coeff, xx, yy, config)
+    residual_field = fit_field - true_field
+    residual_field -= np.mean(residual_field)
+    return xx, yy, true_field, fit_field, residual_field
+
+
 def ice_surface_on_grid(data: DataBundle, ice_node_values: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Evaluate ice log-throughput surface on a dense thickness/wavelength grid."""
     thickness_grid = np.linspace(data.ice_thickness_nodes.min(), data.ice_thickness_nodes.max(), 80)
@@ -1204,6 +1234,113 @@ def make_plots(
             "passband_width_true_vs_fit.png",
         )
 
+    amps = np.arange(config.n_amp)
+    dets = range(data.detector_ids.size)
+    true_amp_offsets = None
+    if data.true_amp_offsets is not None:
+        true_amp_offsets = np.zeros_like(state.amp_offset)
+        for _, row in data.true_amp_offsets.iterrows():
+            det_matches = np.nonzero(data.detector_ids == int(row["detector_id"]))[0]
+            amp_id = int(row["amp_id"])
+            if det_matches.size and 0 <= amp_id < config.n_amp:
+                true_amp_offsets[det_matches[0], amp_id] = row["amp_offset_mag"]
+
+        plt.figure(figsize=(10, 5))
+        for det_i in dets:
+            plt.plot(
+                amps,
+                true_amp_offsets[det_i],
+                marker="o",
+                label=f"det {int(data.detector_ids[det_i]):02d}",
+            )
+        plt.axhline(0.0, color="0.3", linewidth=1)
+        plt.xlabel("Amplifier ID")
+        plt.ylabel("True amp offset [mag]")
+        plt.title("True amplifier offsets")
+        if data.detector_ids.size > 1:
+            plt.legend(ncol=3, fontsize=8)
+        plt.tight_layout()
+        plt.savefig(output_dir / "true_amp_offsets.png", dpi=160)
+        plt.close()
+
+    plt.figure(figsize=(10, 5))
+    for det_i in dets:
+        plt.plot(
+            amps,
+            state.amp_offset[det_i],
+            marker="o",
+            label=f"det {int(data.detector_ids[det_i]):02d}",
+        )
+    plt.axhline(0.0, color="0.3", linewidth=1)
+    plt.xlabel("Amplifier ID")
+    plt.ylabel("Recovered amp offset [mag]")
+    plt.title("Recovered amplifier offsets")
+    if data.detector_ids.size > 1:
+        plt.legend(ncol=3, fontsize=8)
+    plt.tight_layout()
+    plt.savefig(output_dir / "recovered_amp_offsets.png", dpi=160)
+    plt.close()
+
+    if true_amp_offsets is not None:
+        true_centered = true_amp_offsets - true_amp_offsets.mean(axis=1, keepdims=True)
+        fit_centered = state.amp_offset - state.amp_offset.mean(axis=1, keepdims=True)
+        lim = 1.1 * np.max(np.abs(np.r_[true_centered.ravel(), fit_centered.ravel()]))
+        lim = max(lim, 1e-6)
+        plt.figure(figsize=(6, 6))
+        plt.scatter(true_centered.ravel(), fit_centered.ravel(), s=28, alpha=0.8)
+        plt.plot([-lim, lim], [-lim, lim], color="0.2", linewidth=1)
+        plt.xlabel("True amp offset, detector mean removed [mag]")
+        plt.ylabel("Recovered amp offset, detector mean removed [mag]")
+        plt.title("Amplifier offset recovery")
+        plt.xlim(-lim, lim)
+        plt.ylim(-lim, lim)
+        plt.gca().set_aspect("equal", adjustable="box")
+        plt.tight_layout()
+        plt.savefig(output_dir / "amp_offset_comparison.png", dpi=160)
+        plt.close()
+
+    smooth_grid = smooth_fields_on_grid(data, state, config, n_grid=120)
+    if smooth_grid is not None:
+        _, _, true_field, fit_field, residual_field = smooth_grid
+        image_kwargs = {
+            "origin": "lower",
+            "extent": [0, config.nx - 1, 0, config.ny - 1],
+            "aspect": "equal",
+        }
+        plt.figure(figsize=(6.5, 5.5))
+        im = plt.imshow(true_field, **image_kwargs)
+        plt.colorbar(im, label="mag")
+        plt.xlabel("x pixel")
+        plt.ylabel("y pixel")
+        plt.title("True smooth field")
+        plt.tight_layout()
+        plt.savefig(output_dir / "smooth_field_true.png", dpi=160)
+        plt.close()
+
+        plt.figure(figsize=(6.5, 5.5))
+        im = plt.imshow(fit_field, **image_kwargs)
+        plt.colorbar(im, label="mag")
+        plt.xlabel("x pixel")
+        plt.ylabel("y pixel")
+        plt.title("Recovered smooth field")
+        plt.tight_layout()
+        plt.savefig(output_dir / "smooth_field_recovered.png", dpi=160)
+        plt.close()
+
+        plt.figure(figsize=(6.5, 5.5))
+        vmax = np.max(np.abs(residual_field))
+        vmax = max(vmax, 1e-9)
+        im = plt.imshow(
+            residual_field, vmin=-vmax, vmax=vmax, cmap="coolwarm", **image_kwargs
+        )
+        plt.colorbar(im, label="mag")
+        plt.xlabel("x pixel")
+        plt.ylabel("y pixel")
+        plt.title("Recovered - true smooth field, mean removed")
+        plt.tight_layout()
+        plt.savefig(output_dir / "smooth_field_residual.png", dpi=160)
+        plt.close()
+
     if true_ice is not None:
         log_wave, thickness_grid, true_surface = ice_surface_on_grid(data, true_ice)
         _, _, fit_surface = ice_surface_on_grid(data, state.ice_coeff)
@@ -1286,6 +1423,47 @@ def make_plots(
     plt.title("Residual versus ice thickness")
     plt.tight_layout()
     plt.savefig(output_dir / "residual_vs_ice_thickness.png", dpi=160)
+    plt.close()
+
+    x_pix = data.measurements["x"].to_numpy(float)
+    rng = np.random.default_rng(config.random_seed + 1)
+    max_points = 40000
+    if final_resid.size > max_points:
+        sample = rng.choice(final_resid.size, size=max_points, replace=False)
+    else:
+        sample = np.arange(final_resid.size)
+    plt.figure(figsize=(9, 5))
+    plt.scatter(x_pix[sample], final_resid[sample], s=3, alpha=0.25)
+    plt.axhline(0.0, color="0.2", linewidth=1)
+    plt.xlabel("x pixel")
+    plt.ylabel("Photometric residual [mag]")
+    plt.title("Residual versus x")
+    plt.tight_layout()
+    plt.savefig(output_dir / "residual_vs_x.png", dpi=160)
+    plt.close()
+
+    amp_median = np.full((data.detector_ids.size, config.n_amp), np.nan)
+    for det_i in range(data.detector_ids.size):
+        for amp_id in range(config.n_amp):
+            mask = (data.detector_param_id == det_i) & (data.amp_id == amp_id)
+            if np.any(mask):
+                amp_median[det_i, amp_id] = np.median(final_resid[mask])
+    plt.figure(figsize=(10, 5))
+    for det_i in range(data.detector_ids.size):
+        plt.plot(
+            amps,
+            amp_median[det_i],
+            marker="o",
+            label=f"det {int(data.detector_ids[det_i]):02d}",
+        )
+    plt.axhline(0.0, color="0.2", linewidth=1)
+    plt.xlabel("Amplifier ID")
+    plt.ylabel("Median residual [mag]")
+    plt.title("Median residual per amplifier")
+    if data.detector_ids.size > 1:
+        plt.legend(ncol=3, fontsize=8)
+    plt.tight_layout()
+    plt.savefig(output_dir / "residual_vs_amp.png", dpi=160)
     plt.close()
 
     if data.true_star_params is not None:
