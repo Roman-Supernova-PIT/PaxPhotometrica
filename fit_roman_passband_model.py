@@ -215,6 +215,11 @@ def flux_to_abmag(count_flux: np.ndarray, wave_um: np.ndarray, throughput: np.nd
     return -2.5 * np.log10(np.maximum(count_flux, 1e-300) / ref)
 
 
+def counts_to_instrumental_mag(count_flux: np.ndarray) -> np.ndarray:
+    """Convert source count integral to an instrumental magnitude."""
+    return -2.5 * np.log10(np.maximum(count_flux, 1e-300))
+
+
 def amp_id_from_x(x: np.ndarray, nx: int = 4096, n_amp: int = 32) -> np.ndarray:
     """Return amplifier stripe id for detector x pixel coordinate."""
     amp_width = nx // n_amp
@@ -477,7 +482,7 @@ def make_initial_sed_grid(data: DataBundle) -> tuple[np.ndarray, np.ndarray]:
         flux = photon_count_integral(
             sed_shape * data.passbands[filt][None, :], data.wave, axis=1
         )
-        shape_mag[:, filt] = flux_to_abmag(flux, data.wave, data.passbands[filt])
+        shape_mag[:, filt] = counts_to_instrumental_mag(flux)
     return grid_coeff, shape_mag
 
 
@@ -587,10 +592,7 @@ def evaluate_model_and_responses(
         xn, yn = normalized_xy(x_pix[sl], y_pix[sl], nx=config.nx, ny=config.ny)
         smooth = poly_basis(xn, yn) @ state.smooth_coeff
         scalar = state.zp[exp_id] + smooth + state.amp_offset[det, amp]
-        ref_count = np.array(
-            [ab_reference_count(data.wave, data.passbands[filt_id]) for filt_id in filt]
-        )
-        mag_model[sl] = -2.5 * np.log10(np.maximum(denom, 1e-300) / ref_count) + scalar
+        mag_model[sl] = counts_to_instrumental_mag(denom) + scalar
 
         if not need_responses:
             continue
@@ -869,6 +871,58 @@ def smooth_fields_on_grid(
     return xx, yy, true_field, fit_field, residual_field
 
 
+def evaluate_scalar_terms(data: DataBundle, state: ModelState, config: FitConfig) -> np.ndarray:
+    """Evaluate fitted additive scalar terms for each observation."""
+    x_pix = data.measurements["x"].to_numpy(float)
+    y_pix = data.measurements["y"].to_numpy(float)
+    xn, yn = normalized_xy(x_pix, y_pix, nx=config.nx, ny=config.ny)
+    smooth = poly_basis(xn, yn) @ state.smooth_coeff
+    return (
+        state.zp[data.exposure_id]
+        + smooth
+        + state.amp_offset[data.detector_param_id, data.amp_id]
+    )
+
+
+def evaluate_ab_zeropoint_observations(
+    data: DataBundle, state: ModelState, config: FitConfig
+) -> np.ndarray:
+    """AB zeropoint to add to instrumental magnitudes for each observation.
+
+    For the current throughput model, m_AB = m_inst + ZP_AB, where m_inst is
+    -2.5 log10(source counts). The scalar focal-plane terms are already present
+    in the instrumental magnitude model, so they are subtracted here.
+    """
+    if "ice_thickness" in data.measurements.columns:
+        ice_thickness = data.measurements["ice_thickness"].to_numpy(float)
+    else:
+        ice_thickness = data.measurements["ice_amount_obs"].to_numpy(float)
+
+    zp_ab = np.zeros(len(data.measurements))
+    scalar = evaluate_scalar_terms(data, state, config)
+    for start in range(0, len(data.measurements), config.chunk_size):
+        end = min(len(data.measurements), start + config.chunk_size)
+        sl = slice(start, end)
+        filt = data.filter_param_id[sl]
+        det = data.detector_param_id[sl]
+        ice = ice_thickness[sl]
+        logt = (
+            state.shift[filt, det][:, None] * data.phi_shift[filt]
+            + state.width[filt, det][:, None] * data.phi_width[filt]
+            + evaluate_ice_surface_chunk(
+                state.ice_coeff,
+                data.ice_loglam_basis,
+                data.ice_thickness_nodes,
+                ice,
+            )
+        )
+        t_current = data.passbands[filt] * np.exp(logt)
+        ab_flux = ab_f_lambda_per_micron(data.wave)[None, :] * t_current
+        ab_count = photon_count_integral(ab_flux, data.wave, axis=1)
+        zp_ab[sl] = 2.5 * np.log10(np.maximum(ab_count, 1e-300)) - scalar[sl]
+    return zp_ab
+
+
 def ice_surface_on_grid(data: DataBundle, ice_node_values: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Evaluate ice log-throughput surface on a dense thickness/wavelength grid."""
     thickness_grid = np.linspace(data.ice_thickness_nodes.min(), data.ice_thickness_nodes.max(), 80)
@@ -1116,7 +1170,24 @@ def save_outputs(
 
     residuals = data.measurements.copy()
     residuals["mag_residual"] = final_resid
+    residuals["fit_scalar_delta_mag"] = evaluate_scalar_terms(data, state, config)
+    residuals["fit_ab_zeropoint_mag"] = evaluate_ab_zeropoint_observations(data, state, config)
     residuals.to_csv(output_dir / "fit_residuals.csv", index=False)
+
+    residuals[
+        [
+            "obs_id",
+            "exposure_id",
+            "filter_id",
+            "filter_name",
+            "detector_id",
+            "amp_id",
+            "x",
+            "y",
+            "ice_thickness",
+            "fit_ab_zeropoint_mag",
+        ]
+    ].to_csv(output_dir / "fit_ab_zeropoints.csv", index=False)
 
     with open(output_dir / "fit_config.json", "w", encoding="utf-8") as handle:
         payload = dict(config.__dict__)

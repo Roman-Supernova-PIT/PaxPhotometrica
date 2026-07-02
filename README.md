@@ -296,7 +296,10 @@ Notation:
   offsets.
 - `passband_fit_outputs/fit_iteration_summary.csv`: residual RMS by iteration.
 - `passband_fit_outputs/fit_residuals.csv`: observation table plus final
-  residuals.
+  residuals, fitted scalar correction, and fitted AB zeropoint for each
+  observation.
+- `passband_fit_outputs/fit_ab_zeropoints.csv`: per-observation AB zeropoint,
+  `fit_ab_zeropoint_mag`, such that `m_AB = m_inst + fit_ab_zeropoint_mag`.
 - `passband_fit_outputs/*.png`: diagnostic plots, including the passband/ice
   recovery plots plus scalar focal-plane plots such as
   `smooth_field_true.png`, `smooth_field_recovered.png`,
@@ -371,10 +374,15 @@ assumed known exactly by this prototype. The fitter uses their fixed SEDs in
 the forward model and omits their stellar normalization/coefficient update
 columns from the sparse least-squares system.
 
-### Synthetic Photometry And AB Magnitudes
+### Synthetic Photometry And AB Zeropoints
 
-The prototype now uses AB magnitudes with a photon-counting convention. The
-BOSZ EMPCA basis still provides relative SED shapes, so the simulator assigns
+The measurement table now stores instrumental magnitudes, while the absolute
+calibrator stars still carry known AB magnitudes and BOSZ EMPCA SED
+coefficients. This mirrors the real use case: most stars provide relative
+instrumental constraints, and a small set of spectrophotometric standards sets
+the physical AB scale.
+
+The BOSZ EMPCA basis provides relative SED shapes, so the simulator assigns
 each star an amplitude by requiring `mag_norm` to be that star's AB magnitude
 in a reference filter. By default the reference filter is
 `reference_filter_id = 3`, i.e. `F129` for the supplied six-filter file.
@@ -391,38 +399,56 @@ C_source = integral f_lambda,s(lambda)
 ```
 
 where `f_lambda,s(lambda)` is the BOSZ EMPCA shape scaled to the star's
-reference-filter AB magnitude. The constant `1 / hc` is omitted because it
-cancels in the source/reference ratio.
+reference-filter AB magnitude. The constant `1 / hc` is omitted because it is
+common to all photon-counting integrals in this prototype.
 
-For the same passband, the AB reference count is
-
-```text
-C_AB = integral f_lambda,AB(lambda) * T0_b(lambda) * lambda d lambda
-```
-
-where `f_nu,AB = 3631 Jy` and
+The instrumental chromatic magnitude is
 
 ```text
-f_lambda,AB(lambda) = f_nu,AB * c / lambda^2
-```
-
-with the unit conversion needed for wavelength in microns. The chromatic
-magnitude is then
-
-```text
-m_chromatic = -2.5 log10(C_source / C_AB)
+m_inst,chromatic = -2.5 log10(C_source)
 ```
 
 and the scalar calibration terms are added:
 
 ```text
-m_true = m_chromatic + ZP_e + S_smooth(x, y) + A_detector,amp
+m_inst,true = m_inst,chromatic + ZP_e + S_smooth(x, y) + A_detector,amp
 ```
 
 Finally Gaussian noise with standard deviation `mag_unc` is added to produce
-`mag_obs`. For real spectrophotometric standard stars with physical
-`f_lambda` values, the same AB count ratio can be used directly; the simulated
-BOSZ stars simply use `mag_norm` to supply the missing absolute normalization.
+the instrumental measurement `mag_obs`.
+
+For conversion to AB magnitudes, the fitter evaluates the AB reference count
+through the same current passband and ice state:
+
+```text
+C_AB = integral f_lambda,AB(lambda) * T_current(lambda) * lambda d lambda
+```
+
+where `T_current(lambda) = T0_b(lambda) * exp(logT_passband + logT_ice)`,
+`f_nu,AB = 3631 Jy`, and
+
+```text
+f_lambda,AB(lambda) = f_nu,AB * c / lambda^2
+```
+
+with the unit conversion needed for wavelength in microns. The fitted
+per-observation AB zeropoint is
+
+```text
+ZP_AB(obs) = 2.5 log10(C_AB)
+             - [ZP_e + S_smooth(x, y) + A_detector,amp]
+```
+
+so the calibrated AB magnitude is
+
+```text
+m_AB = m_inst + ZP_AB(obs)
+```
+
+For real spectrophotometric standard stars with physical `f_lambda` values, the
+same photon-counting AB convention can be used directly. The simulated BOSZ
+stars use `mag_norm` only to supply the absolute normalization removed by the
+EMPCA preprocessing.
 
 ### Measurement Table
 
@@ -447,6 +473,8 @@ mag_true_no_noise
 true_sed_mag_nominal
 true_passband_delta_mag
 true_ice_delta_mag
+true_ab_mag_nominal
+true_ab_mag_chromatic
 true_zp_delta_mag
 true_smooth_delta_mag
 true_amp_delta_mag
@@ -477,14 +505,19 @@ Column meanings:
 - `ice_thickness`: known ice-thickness coordinate for this observation,
   including exposure/epoch variation and a small position dependence.
 - `ice_amount_obs`: backwards-compatible alias of `ice_thickness`.
-- `mag_obs`: noisy simulated observed magnitude.
+- `mag_obs`: noisy simulated instrumental magnitude.
 - `mag_unc`: 1-sigma magnitude uncertainty used for row weighting.
-- `mag_true_no_noise`: noiseless simulated magnitude including SED, passband,
-  and ice effects.
-- `true_sed_mag_nominal`: noiseless magnitude through the nominal passband only.
-- `true_passband_delta_mag`: magnitude difference from detector passband shift
-  and width perturbations, before ice is applied.
-- `true_ice_delta_mag`: magnitude difference caused by ice throughput loss.
+- `mag_true_no_noise`: noiseless instrumental magnitude including SED,
+  passband, ice, and scalar focal-plane effects.
+- `true_sed_mag_nominal`: noiseless instrumental magnitude through the nominal
+  passband only.
+- `true_passband_delta_mag`: instrumental-magnitude difference from detector
+  passband shift and width perturbations, before ice is applied.
+- `true_ice_delta_mag`: instrumental-magnitude difference caused by ice
+  throughput loss.
+- `true_ab_mag_nominal`: noiseless AB magnitude through the nominal passband.
+- `true_ab_mag_chromatic`: noiseless AB magnitude through the true perturbed
+  passband and ice state, before scalar instrumental terms.
 - `true_zp_delta_mag`: true scalar exposure zeropoint contribution.
 - `true_smooth_delta_mag`: true smooth focal-plane contribution.
 - `true_amp_delta_mag`: true amplifier offset contribution.
@@ -567,22 +600,22 @@ iteration. The verified iteration summary is:
 ```text
 iteration  RMS residual [mag]
 0          0.023675
-1          0.011389
-2          0.007248
-3          0.005395
-4          0.004763
+1          0.011406
+2          0.007261
+3          0.005400
+4          0.004765
 5          0.004559
 ```
 
 Final default diagnostics:
 
 ```text
-Passband shift RMS error: 0.003720 um
-Passband width RMS error: 0.021345
-Ice log-throughput surface RMS error: 0.035057
-Exposure ZP RMS error: 0.037913 mag
-Smooth coefficient RMS error: 0.001036 mag
+Passband shift RMS error: 0.003726 um
+Passband width RMS error: 0.021355
+Ice log-throughput surface RMS error: 0.034870
+Exposure ZP RMS error: 0.037758 mag
+Smooth coefficient RMS error: 0.001035 mag
 Amp offset RMS error, detector means removed: 0.000905 mag
-Stellar EMPCA coefficient RMS error: 0.086218
-Median formal ice-node uncertainty: 0.008376
+Stellar EMPCA coefficient RMS error: 0.086227
+Median formal ice-node uncertainty: 0.008268
 ```

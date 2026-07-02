@@ -42,7 +42,7 @@ AB_FNU_CGS = 3631.0e-23  # erg / s / cm^2 / Hz
 class SimConfig:
     random_seed: int = 12345
     n_star: int = 2000
-    n_exp: int = 60
+    n_exp: int = 30
     n_det: int = 1
     nx: int = 4096
     ny: int = 4096
@@ -184,6 +184,11 @@ def flux_to_abmag(count_flux: np.ndarray, wave_um: np.ndarray, throughput: np.nd
     """Convert photon-counting flux integral to AB magnitude."""
     ref = ab_reference_count(wave_um, throughput)
     return -2.5 * np.log10(np.maximum(count_flux, 1e-300) / ref)
+
+
+def counts_to_instrumental_mag(count_flux: np.ndarray) -> np.ndarray:
+    """Convert source count integral to an instrumental magnitude."""
+    return -2.5 * np.log10(np.maximum(count_flux, 1e-300))
 
 
 def amp_id_from_x(x: np.ndarray, nx: int = 4096, n_amp: int = 32) -> np.ndarray:
@@ -651,10 +656,12 @@ def simulate_data(config: SimConfig) -> None:
             flux_nominal = photon_count_integral(sed * t0, wave)
             flux_pass = photon_count_integral(sed * t_pass, wave)
             flux_true = photon_count_integral(sed * t_true, wave)
-            mag_nominal = flux_to_abmag(flux_nominal, wave, t0)
-            mag_pass = flux_to_abmag(flux_pass, wave, t0)
-            mag_chromatic = flux_to_abmag(flux_true, wave, t0)
-            mag_true = mag_chromatic + scalar_delta
+            inst_mag_nominal = counts_to_instrumental_mag(flux_nominal)
+            inst_mag_pass = counts_to_instrumental_mag(flux_pass)
+            inst_mag_chromatic = counts_to_instrumental_mag(flux_true)
+            ab_mag_nominal = flux_to_abmag(flux_nominal, wave, t0)
+            ab_mag_chromatic = flux_to_abmag(flux_true, wave, t_true)
+            mag_true = inst_mag_chromatic + scalar_delta
             mag_obs = mag_true + rng.normal(0.0, config.phot_sigma_mag)
 
             rows.append(
@@ -674,9 +681,11 @@ def simulate_data(config: SimConfig) -> None:
                     "mag_obs": mag_obs,
                     "mag_unc": config.phot_sigma_mag,
                     "mag_true_no_noise": mag_true,
-                    "true_sed_mag_nominal": mag_nominal,
-                    "true_passband_delta_mag": mag_pass - mag_nominal,
-                    "true_ice_delta_mag": mag_chromatic - mag_pass,
+                    "true_sed_mag_nominal": inst_mag_nominal,
+                    "true_passband_delta_mag": inst_mag_pass - inst_mag_nominal,
+                    "true_ice_delta_mag": inst_mag_chromatic - inst_mag_pass,
+                    "true_ab_mag_nominal": ab_mag_nominal,
+                    "true_ab_mag_chromatic": ab_mag_chromatic,
                     "true_zp_delta_mag": true_zp[exp_id],
                     "true_smooth_delta_mag": smooth_delta,
                     "true_amp_delta_mag": amp_delta,
@@ -701,7 +710,9 @@ def simulate_data(config: SimConfig) -> None:
     metadata["filter_centers_um"] = filter_centers.tolist()
     metadata["reference_filter_id"] = int(config.reference_filter_id)
     metadata["reference_filter_name"] = filter_names[config.reference_filter_id]
-    metadata["magnitude_system"] = "AB"
+    metadata["measurement_magnitude_system"] = "instrumental"
+    metadata["standard_star_magnitude_system"] = "AB"
+    metadata["magnitude_system"] = "instrumental_measurements_ab_standards"
     metadata["synthetic_photometry"] = "photon_counting_f_lambda_T_lambda_lambda_dlambda"
     metadata["ice_loglam_nodes_file"] = config.ice_loglam_nodes_file
     metadata["n_ice_loglam_nodes"] = int(loglam_nodes.size)
