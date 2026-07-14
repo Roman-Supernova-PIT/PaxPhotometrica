@@ -37,6 +37,7 @@ import numpy as np
 import pandas as pd
 from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import lsmr, lsqr
+from tqdm import tqdm
 
 
 MAG_FACTOR = 2.5 / np.log(10.0)
@@ -490,6 +491,16 @@ def load_data(config: FitConfig) -> DataBundle:
         prism_nominal_throughput = nominal_prism["nominal_throughput"].to_numpy(float)
         if prism_pixel_id.min() < 0 or prism_pixel_id.max() >= prism_wave.size:
             raise ValueError("Prism measurement wavelength_pixel_id is out of range")
+        # Wavelength calibration is deliberately outside this fit. The supplied
+        # pixel-to-wavelength mapping is fixed and must agree with every row.
+        if "wavelength_um" in prism_measurements:
+            row_wave = prism_measurements["wavelength_um"].to_numpy(float)
+            fixed_wave = prism_wave[prism_pixel_id]
+            if not np.allclose(row_wave, fixed_wave, rtol=0.0, atol=1e-12):
+                raise ValueError(
+                    "Prism measurement wavelengths do not match the fixed "
+                    "nominal_prism.csv wavelength solution"
+                )
         prism_mean_log_flux = np.interp(
             prism_wave, wave, sed_library.mean_log_flux
         )
@@ -682,9 +693,10 @@ def fit_initial_stellar_seds(data: DataBundle, config: FitConfig) -> ModelState:
         amp_offset,
     )
     if not data.prism_measurements.empty and np.any(data.star_is_calibrator):
-        # Bootstrap the wavelength response from fixed standards in the prism
-        # reference exposure. The later joint iterations separate this initial
-        # response estimate from ice and focal-plane terms using all dithers.
+        # Bootstrap the spectrophotometric response from fixed standards in the
+        # prism reference exposure. The later joint iterations separate this
+        # initial response estimate from ice and focal-plane terms using all
+        # dithers.
         prism_reference = data.sim_metadata.get("prism_reference_exposure_id")
         standard = data.star_is_calibrator[data.prism_star_param_id]
         if prism_reference is not None:
@@ -839,7 +851,8 @@ def evaluate_prism_model_and_responses(
     Each prism row is a finite wavelength-bin photon-counting measurement. The
     midpoint quadrature used by the simulator is linear in physical flux. A
     fitted additive magnitude response at every wavelength pixel represents the
-    prism's wavelength-dependent sensitivity calibration. Ice, stellar SED,
+    prism's spectrophotometric sensitivity calibration. The wavelength assigned
+    to each pixel is fixed input, not a fitted parameter. Ice, stellar SED,
     focal-plane, and amplifier terms are evaluated at that same detector pixel.
     """
     n_obs = len(data.prism_measurements)
@@ -1572,7 +1585,14 @@ def run_fit(
     )
     print(f"Initial combined RMS residual: {rms(initial_all_resid):.6f} mag")
 
-    for iteration in range(1, config.n_iter + 1):
+    iteration_progress = tqdm(
+        range(1, config.n_iter + 1),
+        total=config.n_iter,
+        desc="Fit iterations",
+        unit="iter",
+        dynamic_ncols=True,
+    )
+    for iteration in iteration_progress:
         lin = evaluate_model_and_responses(data, state, config, need_responses=True)
         prism_lin = evaluate_prism_model_and_responses(
             data, state, config, need_responses=True
@@ -1623,7 +1643,7 @@ def run_fit(
             trial_damping *= 0.5
 
         if accepted_damping == 0.0:
-            print(
+            iteration_progress.write(
                 f"Iteration {iteration}: no tested damping improved the joint "
                 "weighted objective; update rejected."
             )
@@ -1643,15 +1663,11 @@ def run_fit(
                 ),
             }
         )
-        prism_message = (
-            f"prism = {rms(prism_resid):.6f} mag, " if prism_resid.size else ""
-        )
-        print(
-            f"Iteration {iteration}: combined RMS = {rms(all_resid):.6f} mag, "
-            f"imaging = {rms(resid):.6f} mag, "
-            f"{prism_message}damping = {accepted_damping:.5f}, "
-            f"LSMR iters = {result[2]}"
-        )
+        progress_metrics = [f"i={rms(resid):.4f}"]
+        if prism_resid.size:
+            progress_metrics.append(f"p={rms(prism_resid):.4f}")
+        progress_metrics.append(f"d={accepted_damping:.3f}")
+        iteration_progress.set_postfix_str(" ".join(progress_metrics))
 
     final_lin = evaluate_model_and_responses(data, state, config, need_responses=False)
     final_prism_lin = evaluate_prism_model_and_responses(
@@ -2023,7 +2039,7 @@ def print_diagnostics(
         true_response = truth["prism_response_mag"].to_numpy(float)
         if true_response.size == state.prism_response.size:
             print(
-                "Prism wavelength-response RMS error: "
+                "Prism spectrophotometric-response RMS error: "
                 f"{rms(state.prism_response - true_response):.6f} mag"
             )
     if data.true_exposure_zeropoints is not None:
@@ -2197,7 +2213,7 @@ def make_plots(
                 label="formal 1-sigma",
             )
         axes[0].set_ylabel("Prism response [mag]")
-        axes[0].set_title("Prism wavelength calibration recovery")
+        axes[0].set_title("Prism spectrophotometric response recovery")
         axes[0].legend()
         axes[1].plot(data.prism_wave, response_residual, color="tab:red")
         axes[1].axhline(0.0, color="0.3", linewidth=1)

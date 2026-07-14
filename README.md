@@ -17,8 +17,8 @@ artifacts intended to be easy to inspect.
 
 ## Dependencies
 
-Use a Python environment with `numpy`, `pandas`, `scipy`, and `matplotlib`. On
-this machine, the Anaconda interpreter works:
+Use a Python environment with `numpy`, `pandas`, `scipy`, `matplotlib`, and
+`tqdm`. On this machine, the Anaconda interpreter works:
 
 ```bash
 /opt/anaconda3/bin/python --version
@@ -235,6 +235,13 @@ pixel `p`. It is equivalent to multiplying throughput by
 from imaging exposure 0, to remove the exact additive degeneracy between all
 `P_p` values and all prism exposure zeropoints.
 
+The prism wavelength solution is not fitted here. The mapping from
+`wavelength_pixel_id` to `lambda_p` is read from `nominal_prism.csv`, which is
+generated from the supplied `prism wavelengths` file, and remains fixed during
+every iteration. A separate emission-line ubercalibration can determine that
+mapping before these spectrophotometric calibration scripts are run. `P_p` is
+a flux-sensitivity/zeropoint term, not a wavelength-shift or dispersion term.
+
 Notation:
 
 - `lambda`: wavelength in microns.
@@ -278,7 +285,7 @@ Notation:
   wavelengths.
 - `p`: zero-based prism wavelength-pixel index.
 - `lambda_p`, `Delta_lambda_p`: prism pixel center and wavelength-bin width in
-  microns.
+  microns, supplied as fixed inputs rather than fitted parameters.
 - `T_prism,0(lambda_p)`: toy nominal prism throughput envelope.
 - `P_p`: fitted wavelength-dependent prism response correction in magnitudes.
 
@@ -311,7 +318,8 @@ Notation:
   wavelength pixel. Only a configurable fraction of stars receive prism
   spectra, but all fixed spectrophotometric standards are included.
 - `passband_sim_outputs/nominal_prism.csv`: prism wavelength-pixel centers,
-  finite bin edges/widths, and nominal toy throughput.
+  finite bin edges/widths, and nominal toy throughput. This table is the fixed
+  wavelength solution used by the fit.
 - `passband_sim_outputs/true_prism_response.csv`: true wavelength-dependent
   prism sensitivity correction in magnitudes.
 - `passband_sim_outputs/nominal_passbands.csv`: long-form nominal passbands.
@@ -386,6 +394,10 @@ Notation:
 /opt/anaconda3/bin/python simulate_roman_passband_data.py
 /opt/anaconda3/bin/python fit_roman_passband_model.py
 ```
+
+The fitter displays a `tqdm` progress bar over the requested nonlinear
+iterations. Its compact postfix reports imaging RMS (`i`), prism RMS (`p`), and
+the accepted damping factor (`d`) from the latest completed iteration.
 
 Useful fitter options:
 
@@ -706,7 +718,9 @@ relative constraints on the same amplifier gains used by all six filters.
 
 All five default absolute calibrators receive prism spectra. Their `mag_norm`
 and BOSZ EMPCA coefficients remain fixed, so they act as spectrophotometric
-standards and determine the absolute wavelength-dependent prism calibration.
+standards and determine the absolute wavelength-dependent prism
+spectrophotometric response. They do not constrain or update the wavelength
+assigned to any detector pixel.
 The other prism targets use the same free stellar parameters as their imaging
 measurements.
 
@@ -736,10 +750,11 @@ The first prism exposure is also fixed to zero. Prism rows contain the same
 stellar normalization/EMPCA, ice-spline, exposure, and amplifier columns as
 imaging where applicable, plus the smooth-field columns for that prism
 wavelength and detector. They do not contain imaging-filter shift or width
-columns. Their amplifier column points into the exact same parameter block as
-imaging, which enforces the shared-gain requirement directly in the sparse
-system. Imaging filters likewise have separate smooth-field blocks, so spatial
-chromatic structure cannot be forced into a single achromatic star flat.
+columns, and no prism wavelength-solution columns are present. Their amplifier
+column points into the exact same parameter block as imaging, which enforces
+the shared-gain requirement directly in the sparse system. Imaging filters
+likewise have separate smooth-field blocks, so spatial chromatic structure
+cannot be forced into a single achromatic star flat.
 
 The prism reference exposure is simulated at zero ice thickness and contains
 all fixed standards. The fitter uses those rows to bootstrap `P_p` before the
@@ -834,7 +849,7 @@ Final default diagnostics:
 Passband shift RMS error: 0.008800 um
 Passband width RMS error: 0.055003
 Ice log-throughput surface RMS error: 0.025236
-Prism wavelength-response RMS error: 0.002179 mag
+Prism spectrophotometric-response RMS error: 0.002179 mag
 Exposure ZP RMS error: 0.122851 mag
 Imaging smooth-coefficient RMS error: 0.002012 mag
 Prism smooth-coefficient RMS error: 0.003158 mag

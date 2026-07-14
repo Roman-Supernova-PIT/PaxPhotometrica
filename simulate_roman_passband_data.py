@@ -496,7 +496,8 @@ def read_prism_wavelength_grid(
     bin_width = np.diff(edges)
 
     # A smooth, dimensionless nominal prism envelope. Its absolute normalization
-    # is arbitrary because the wavelength-by-wavelength calibration is fitted.
+    # is arbitrary because a wavelength-dependent spectrophotometric response
+    # is fitted. The pixel-to-wavelength mapping itself remains fixed.
     phase = np.linspace(0.0, np.pi, wavelength.size)
     nominal_throughput = 0.55 + 0.40 * np.sin(phase) ** 0.7
     return wavelength, edges[:-1], edges[1:], nominal_throughput
