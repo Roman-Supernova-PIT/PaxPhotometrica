@@ -5,7 +5,7 @@ This utility reads the CSV products written by ``fit_roman_passband_model.py``
 and evaluates, for arbitrary observations:
 
 * the scalar instrumental calibration term
-  ``ZP_exposure + S_smooth(x, y) + A_detector,amp``;
+  ``ZP_exposure + S_imaging,filter,detector(x, y) + A_detector,amp``;
 * the fitted chromatic passband, including detector shift/width and ice;
 * the AB zeropoint that converts instrumental magnitudes to AB magnitudes.
 
@@ -57,7 +57,7 @@ class CalibrationProducts:
     phi_width: np.ndarray
     shift_width: pd.DataFrame
     exposure_zp: dict[int, float]
-    smooth_coeff: np.ndarray
+    imaging_smooth_coeff: dict[tuple[int, int], np.ndarray]
     amp_offsets: dict[tuple[int, int], float]
     ice_loglam_nodes: np.ndarray
     ice_thickness_nodes: np.ndarray
@@ -197,11 +197,31 @@ def load_calibration_products(config: QueryConfig) -> CalibrationProducts:
     exposure_zp = {
         int(row.exposure_id): float(row.zp_mag) for row in exposure_table.itertuples(index=False)
     }
-    smooth_map = {
-        str(row.basis_name): float(row.coefficient_mag)
-        for row in smooth_table.itertuples(index=False)
-    }
-    smooth_coeff = np.array([smooth_map[name] for name in ["x", "y", "x2", "xy", "y2"]])
+    basis_names = ["x", "y", "x2", "xy", "y2"]
+    imaging_smooth_coeff = {}
+    if "measurement_type" in smooth_table.columns:
+        imaging_rows = smooth_table.loc[
+            smooth_table["measurement_type"] == "imaging"
+        ]
+        for (filter_id, detector_id), group in imaging_rows.groupby(
+            ["filter_id", "detector_id"]
+        ):
+            smooth_map = {
+                str(row.basis_name): float(row.coefficient_mag)
+                for row in group.itertuples(index=False)
+            }
+            imaging_smooth_coeff[(int(filter_id), int(detector_id))] = np.array(
+                [smooth_map[name] for name in basis_names]
+            )
+    else:
+        smooth_map = {
+            str(row.basis_name): float(row.coefficient_mag)
+            for row in smooth_table.itertuples(index=False)
+        }
+        shared_coeff = np.array([smooth_map[name] for name in basis_names])
+        for filter_id in filter_ids:
+            for detector_id in shift_width["detector_id"].unique():
+                imaging_smooth_coeff[(int(filter_id), int(detector_id))] = shared_coeff
     amp_offsets = {
         (int(row.detector_id), int(row.amp_id)): float(row.amp_offset_mag)
         for row in amp_table.itertuples(index=False)
@@ -226,7 +246,7 @@ def load_calibration_products(config: QueryConfig) -> CalibrationProducts:
         phi_width=mode_data["phi_width"],
         shift_width=shift_width,
         exposure_zp=exposure_zp,
-        smooth_coeff=smooth_coeff,
+        imaging_smooth_coeff=imaging_smooth_coeff,
         amp_offsets=amp_offsets,
         ice_loglam_nodes=ice_loglam_nodes,
         ice_thickness_nodes=ice_thickness_nodes,
@@ -338,7 +358,23 @@ def current_passbands_for_queries(
 def evaluate_scalar_terms(query: pd.DataFrame, products: CalibrationProducts) -> np.ndarray:
     """Evaluate fitted scalar instrumental terms for each query row."""
     xn, yn = normalized_xy(query["x"].to_numpy(float), query["y"].to_numpy(float), products.nx, products.ny)
-    smooth = poly_basis(xn, yn) @ products.smooth_coeff
+    basis = poly_basis(xn, yn)
+    smooth_coeff = []
+    missing_smooth = []
+    for filter_id, detector_id in zip(
+        query["filter_id"].to_numpy(int), query["detector_id"].to_numpy(int)
+    ):
+        coeff = products.imaging_smooth_coeff.get((int(filter_id), int(detector_id)))
+        if coeff is None:
+            missing_smooth.append((int(filter_id), int(detector_id)))
+            coeff = np.full(5, np.nan)
+        smooth_coeff.append(coeff)
+    if missing_smooth:
+        raise ValueError(
+            "No fitted imaging smooth field for filter/detector pairs: "
+            f"{sorted(set(missing_smooth))}"
+        )
+    smooth = np.einsum("ij,ij->i", basis, np.asarray(smooth_coeff))
 
     zp = np.array(
         [

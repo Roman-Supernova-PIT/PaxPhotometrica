@@ -6,10 +6,11 @@ Telescope WFI-style calibration experiments.
 - The first prototype fits scalar relative photometric calibration terms:
   stellar magnitudes, exposure zeropoints, smooth star-flat structure, and
   per-amplifier offsets.
-- The second prototype fits chromatic calibration terms after scalar
-  instrumental calibration: stellar BOSZ EMPCA SED coefficients,
-  detector-level passband shifts/width changes, and a 2D ice log-throughput
-  surface.
+- The second prototype jointly fits scalar and chromatic calibration terms:
+  stellar BOSZ EMPCA SED coefficients, detector-level passband shifts/width
+  changes, a 2D ice log-throughput surface, filter- and wavelength-dependent
+  smooth focal-plane fields, and amplifier gains shared by imaging and prism
+  data.
 
 Both prototypes use deterministic simulations, sparse linear algebra, and CSV
 artifacts intended to be easy to inspect.
@@ -170,7 +171,8 @@ passband/ice calibration and sparse Roman prism spectroscopy. It simulates
 dithered stellar photometry plus prism spectra for a fraction of the stars and
 fits stellar SED parameters, scalar exposure/focal-plane/amplifier terms,
 passband shift/width terms, an ice log-throughput surface, and one prism
-sensitivity correction for every prism wavelength pixel.
+sensitivity correction and one smooth focal-plane field for every prism
+wavelength pixel.
 
 The broadband flux model is evaluated with linear flux integrals:
 
@@ -198,7 +200,7 @@ ubercalibration toy model:
 ```text
 m_obs = -2.5 log10(F_pred)
       + ZP_e
-      + S_smooth(x, y)
+      + S_imaging,b,d(x, y)
       + A_detector,amp
       + noise
 ```
@@ -222,7 +224,7 @@ and the instrumental prism magnitude model is
 m_prism,obs = -2.5 log10(C_prism,s,p)
               + P_p
               + ZP_e
-              + S_smooth(x, y)
+              + S_prism,p,d(x, y)
               + A_detector,amp
               + noise
 ```
@@ -263,11 +265,17 @@ Notation:
   from a rectangular spline grid in log10 wavelength and ice thickness.
 - `ZP_e`: fitted scalar zeropoint for exposure `e`; exposure 0 is fixed to zero
   as the reference.
-- `S_smooth(x, y)`: fitted smooth detector-coordinate polynomial with terms
-  `x, y, x^2, x*y, y^2`.
+- `S_imaging,b,d(x, y)`: fitted imaging smooth detector-coordinate polynomial
+  for filter `b` and detector `d`, with terms `x, y, x^2, x*y, y^2`.
+- `S_prism,p,d(x, y)`: fitted prism smooth detector-coordinate polynomial for
+  wavelength pixel `p` and detector `d`, using the same five-term basis. Each
+  prism wavelength has its own field; a wavelength second-difference prior
+  regularizes the sequence without forcing the fields to be identical.
 - `amp`: zero-based amplifier stripe ID computed from detector `x` coordinate.
 - `A_detector,amp`: fitted additive magnitude offset for detector/amplifier
-  pair, with mean amp offset per detector constrained to zero.
+  pair, with mean amp offset per detector constrained to zero. This is one
+  shared amplifier correction used by all imaging filters and prism
+  wavelengths.
 - `p`: zero-based prism wavelength-pixel index.
 - `lambda_p`, `Delta_lambda_p`: prism pixel center and wavelength-bin width in
   microns.
@@ -324,7 +332,10 @@ Notation:
 - `passband_sim_outputs/true_exposure_zeropoints.csv`: true scalar exposure
   zeropoints.
 - `passband_sim_outputs/true_smooth_coeffs.csv`: true smooth focal-plane
-  polynomial coefficients.
+  polynomial coefficients in long form. `measurement_type` identifies imaging
+  or prism rows; imaging rows carry `filter_id`, while prism rows carry
+  `wavelength_pixel_id` and `wavelength_um`. Every row also carries the
+  one-based `detector_id` and polynomial `basis_name`.
 - `passband_sim_outputs/true_amp_offsets.csv`: true per-detector/per-amplifier
   additive magnitude offsets.
 - `passband_fit_outputs/fit_*params.csv`: recovered stellar, passband, ice, and
@@ -336,8 +347,9 @@ Notation:
   values and formal node uncertainties from the final LSQR variance estimate.
 - `passband_fit_outputs/fit_exposure_zeropoints.csv`: recovered scalar
   exposure zeropoints.
-- `passband_fit_outputs/fit_smooth_coeffs.csv`: recovered smooth focal-plane
-  polynomial coefficients.
+- `passband_fit_outputs/fit_smooth_coeffs.csv`: recovered imaging
+  filter/detector and prism wavelength/detector smooth polynomial coefficients,
+  in the same long-form layout as the truth table, with formal uncertainties.
 - `passband_fit_outputs/fit_amp_offsets.csv`: recovered per-detector/per-amp
   offsets.
 - `passband_fit_outputs/fit_prism_response.csv`: recovered prism correction
@@ -355,13 +367,18 @@ Notation:
   `fit_ab_zeropoint_mag`, such that `m_AB = m_inst + fit_ab_zeropoint_mag`.
 - `passband_fit_outputs/*.png`: diagnostic plots, including the passband/ice
   recovery plots plus scalar focal-plane plots such as
-  `smooth_field_true.png`, `smooth_field_recovered.png`,
-  `smooth_field_residual.png`, `true_amp_offsets.png`,
+  `smooth_field_true.png`, `smooth_field_recovered.png`, and
+  `smooth_field_residual.png` show one imaging panel per filter for detector 1;
+  additional detectors receive detector-suffixed files. Other plots include
+  `true_amp_offsets.png`,
   `recovered_amp_offsets.png`, `amp_offset_comparison.png`,
   `residual_vs_x.png`, and `residual_vs_amp.png`.
   Prism diagnostics include `prism_response_true_vs_fit.png`,
   `prism_residual_vs_wavelength.png`, `prism_residual_histogram.png`, and
-  `prism_standard_absolute_calibration.png`.
+  `prism_standard_absolute_calibration.png`. `prism_smooth_coefficients.png`
+  shows every fitted spatial coefficient versus wavelength and
+  `prism_smooth_field_samples.png` compares true, fitted, and residual fields
+  at representative wavelengths.
 
 ### Run
 
@@ -511,7 +528,10 @@ m_inst,chromatic = -2.5 log10(C_source)
 and the scalar calibration terms are added:
 
 ```text
-m_inst,true = m_inst,chromatic + ZP_e + S_smooth(x, y) + A_detector,amp
+m_inst,true = m_inst,chromatic
+            + ZP_e
+            + S_imaging,b,d(x, y)
+            + A_detector,amp
 ```
 
 Finally Gaussian noise with standard deviation `mag_unc` is added to produce
@@ -536,7 +556,7 @@ per-observation AB zeropoint is
 
 ```text
 ZP_AB(obs) = 2.5 log10(C_AB)
-             - [ZP_e + S_smooth(x, y) + A_detector,amp]
+             - [ZP_e + S_imaging,b,d(x, y) + A_detector,amp]
 ```
 
 so the calibrated AB magnitude is
@@ -560,7 +580,7 @@ The fitted prism AB zeropoint is
 ```text
 ZP_AB,prism(obs) = 2.5 log10(C_AB,prism,p)
                    - P_p
-                   - [ZP_e + S_smooth(x, y) + A_detector,amp]
+                   - [ZP_e + S_prism,p,d(x, y) + A_detector,amp]
 ```
 
 so `mag_obs + ZP_AB,prism(obs)` is the calibrated narrow-bin AB magnitude.
@@ -707,15 +727,19 @@ solve updates for:
 - global ice log-throughput spline node values.
 - one global prism sensitivity correction per wavelength pixel,
 - per-exposure scalar zeropoints, with exposure 0 fixed to zero,
-- smooth focal-plane polynomial coefficients,
+- per-filter/per-detector imaging smooth focal-plane polynomial coefficients,
+- per-wavelength-pixel/per-detector prism smooth focal-plane polynomial
+  coefficients,
 - per-detector/per-amplifier additive offsets.
 
 The first prism exposure is also fixed to zero. Prism rows contain the same
-stellar normalization/EMPCA, ice-spline, smooth-field, exposure, and amplifier
-columns as imaging where applicable. They do not contain imaging-filter shift
-or width columns. Their amplifier column points into the exact same parameter
-block as imaging, which enforces the shared-gain requirement directly in the
-sparse system.
+stellar normalization/EMPCA, ice-spline, exposure, and amplifier columns as
+imaging where applicable, plus the smooth-field columns for that prism
+wavelength and detector. They do not contain imaging-filter shift or width
+columns. Their amplifier column points into the exact same parameter block as
+imaging, which enforces the shared-gain requirement directly in the sparse
+system. Imaging filters likewise have separate smooth-field blocks, so spatial
+chromatic structure cannot be forced into a single achromatic star flat.
 
 The prism reference exposure is simulated at zero ice thickness and contains
 all fixed standards. The fitter uses those rows to bootstrap `P_p` before the
@@ -754,6 +778,10 @@ pseudo-observation rows for weak priors:
 - prism response amplitude prior: `sigma_prism_response_prior = 0.20 mag`,
 - prism response second-difference prior:
   `sigma_prism_response_smoothness = 0.01 mag`,
+- imaging and prism smooth-coefficient amplitude prior:
+  `sigma_smooth_prior = 0.02 mag`,
+- prism smooth-coefficient wavelength second-difference prior:
+  `sigma_prism_smoothness = 0.0001 mag`,
 - stellar EMPCA coefficient update prior:
   `sigma_sed_coeff_update_prior_scale = 0.05` times the empirical standard
   deviation of each BOSZ coefficient in the basis file.
@@ -781,38 +809,39 @@ log-throughput perturbation.
 
 ### Default Verification
 
-A default run currently produces `45,061` imaging observations and `13,356`
-prism wavelength-pixel measurements from `69` extracted spectra. The prism
+A default run currently produces `45,532` imaging observations and `14,125`
+prism wavelength-pixel measurements from `75` extracted spectra. The prism
 targets are 1% of the 2,000-star sample, including all `5` fixed absolute
-calibrators. The fit solves `10,295` linearized update parameters per iteration.
+calibrators. The fit solves `11,290` linearized update parameters per iteration.
 The verified iteration summary is:
 
 ```text
 iteration  combined RMS  imaging RMS  prism RMS  accepted damping
-0          0.030934      0.027494     0.040435   0.000
-1          0.028461      0.025735     0.036172   0.125
-2          0.026142      0.023927     0.032520   0.125
-3          0.022274      0.020892     0.026408   0.250
-4          0.016812      0.016245     0.018599   0.500
-5          0.011257      0.009421     0.015962   0.500
-6          0.009133      0.006312     0.015178   0.500
-7          0.008498      0.005237     0.014946   0.500
-8          0.008321      0.004921     0.014870   0.500
+0          0.031705      0.028457     0.040437   0.0000
+1          0.029405      0.026049     0.038271   0.0625
+2          0.026553      0.023654     0.034267   0.1250
+3          0.024330      0.023246     0.027537   0.2500
+4          0.020872      0.021460     0.018852   0.5000
+5          0.013065      0.012043     0.015918   0.5000
+6          0.009751      0.007354     0.015075   0.5000
+7          0.008710      0.005569     0.014847   0.5000
+8          0.008422      0.005015     0.014783   0.5000
 ```
 
 Final default diagnostics:
 
 ```text
-Passband shift RMS error: 0.008650 um
-Passband width RMS error: 0.053119
-Ice log-throughput surface RMS error: 0.034465
-Prism wavelength-response RMS error: 0.002109 mag
-Exposure ZP RMS error: 0.108633 mag
-Smooth coefficient RMS error: 0.000903 mag
-Amp offset RMS error, detector means removed: 0.000961 mag
-Stellar EMPCA coefficient RMS error: 0.163283
-Median formal ice-node uncertainty: 0.007240
-Median formal prism-response uncertainty: 0.000990 mag
+Passband shift RMS error: 0.008800 um
+Passband width RMS error: 0.055003
+Ice log-throughput surface RMS error: 0.025236
+Prism wavelength-response RMS error: 0.002179 mag
+Exposure ZP RMS error: 0.122851 mag
+Imaging smooth-coefficient RMS error: 0.002012 mag
+Prism smooth-coefficient RMS error: 0.003158 mag
+Amp offset RMS error, detector means removed: 0.001157 mag
+Stellar EMPCA coefficient RMS error: 0.155726
+Median formal ice-node uncertainty: 0.003234
+Median formal prism-response uncertainty: 0.001006 mag
 ```
 
 The imaging and prism residuals reach their injected noise scales, but the

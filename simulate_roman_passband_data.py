@@ -7,8 +7,9 @@ small passband shifts, passband width changes, and ice-induced
 wavelength/thickness-dependent throughput changes.
 
 A configurable fraction of stars also receives vertically dispersed prism
-spectra. Prism wavelength pixels share the imaging amplifier gains and scalar
-focal-plane model while carrying their own wavelength-dependent response.
+spectra. Imaging smooth focal-plane fields vary by filter and detector, prism
+smooth fields vary by wavelength pixel and detector, and all measurements
+share the same detector/amplifier gains.
 
 Throughput perturbations are modeled in log-throughput space because small
 multiplicative throughput changes then add linearly. Observations are still
@@ -74,6 +75,7 @@ class SimConfig:
     dither_sigma_pix: float = 500.0
     zp_sigma_mag: float = 0.01
     amp_sigma_mag: float = 0.003
+    smooth_variation_sigma_mag: float = 0.0007
     prism_response_sigma_mag: float = 0.015
     shift_sigma_um: float = 0.001
     width_sigma: float = 0.01
@@ -514,6 +516,50 @@ def make_true_prism_response(
     return response
 
 
+def make_true_smooth_coefficients(
+    config: SimConfig,
+    prism_wave: np.ndarray,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Create band-, detector-, and wavelength-dependent star-flat fields.
+
+    Imaging coefficients have shape ``(filter, detector, polynomial_term)``.
+    Prism coefficients have shape ``(wavelength_pixel, detector,
+    polynomial_term)``. The wavelength variation is smooth, but every prism
+    pixel retains its own coefficient vector in the fit.
+    """
+    base = np.asarray(config.true_smooth_coeffs, dtype=float)
+    imaging = np.zeros((config.n_filter, config.n_det, base.size))
+    for filt in range(config.n_filter):
+        phase = 2.0 * np.pi * (filt + 0.5) / config.n_filter
+        chromatic = 1.0 + 0.18 * np.sin(phase + 0.55 * np.arange(base.size))
+        for det in range(config.n_det):
+            detector_scale = 1.0 + 0.025 * (det - 0.5 * (config.n_det - 1))
+            imaging[filt, det] = base * chromatic * detector_scale
+            imaging[filt, det] += rng.normal(
+                0.0, config.smooth_variation_sigma_mag, base.size
+            )
+
+    u = (prism_wave - prism_wave.min()) / np.ptp(prism_wave)
+    prism = np.zeros((prism_wave.size, config.n_det, base.size))
+    for det in range(config.n_det):
+        detector_scale = 1.0 + 0.025 * (det - 0.5 * (config.n_det - 1))
+        for basis_id in range(base.size):
+            chromatic = 1.0 + 0.22 * np.sin(
+                2.0 * np.pi * (u * (0.8 + 0.15 * basis_id) + 0.11 * basis_id)
+            )
+            prism[:, det, basis_id] = base[basis_id] * chromatic * detector_scale
+            prism[:, det, basis_id] += gaussian_smooth_1d(
+                rng.normal(
+                    0.0,
+                    0.35 * config.smooth_variation_sigma_mag,
+                    prism_wave.size,
+                ),
+                4.0,
+            )
+    return imaging, prism
+
+
 def write_passband_files(
     output_dir: Path,
     wave: np.ndarray,
@@ -689,7 +735,9 @@ def simulate_data(config: SimConfig) -> None:
     true_zp[0] = 0.0
     if config.n_prism_exp > 0:
         true_zp[config.n_exp] = 0.0
-    true_smooth_coeffs = np.asarray(config.true_smooth_coeffs, dtype=float)
+    true_imaging_smooth, true_prism_smooth = make_true_smooth_coefficients(
+        config, prism_wave, rng
+    )
     true_amp_offsets = rng.normal(
         0.0, config.amp_sigma_mag, size=(config.n_det, config.n_amp)
     )
@@ -705,12 +753,43 @@ def simulate_data(config: SimConfig) -> None:
             "zp_mag": true_zp,
         }
     ).to_csv(output_dir / "true_exposure_zeropoints.csv", index=False)
-    pd.DataFrame(
-        {
-            "basis_name": ["x", "y", "x2", "xy", "y2"],
-            "coefficient_mag": true_smooth_coeffs,
-        }
-    ).to_csv(output_dir / "true_smooth_coeffs.csv", index=False)
+    smooth_rows = []
+    basis_names = ["x", "y", "x2", "xy", "y2"]
+    for filt in range(config.n_filter):
+        for det_index, det_id in enumerate(detector_ids):
+            for basis_id, basis_name in enumerate(basis_names):
+                smooth_rows.append(
+                    {
+                        "measurement_type": "imaging",
+                        "filter_id": filt,
+                        "filter_name": filter_names[filt],
+                        "wavelength_pixel_id": np.nan,
+                        "wavelength_um": np.nan,
+                        "detector_id": det_id,
+                        "basis_name": basis_name,
+                        "coefficient_mag": true_imaging_smooth[
+                            filt, det_index, basis_id
+                        ],
+                    }
+                )
+    for pixel_id, wavelength in enumerate(prism_wave):
+        for det_index, det_id in enumerate(detector_ids):
+            for basis_id, basis_name in enumerate(basis_names):
+                smooth_rows.append(
+                    {
+                        "measurement_type": "prism",
+                        "filter_id": np.nan,
+                        "filter_name": "PRISM",
+                        "wavelength_pixel_id": pixel_id,
+                        "wavelength_um": wavelength,
+                        "detector_id": det_id,
+                        "basis_name": basis_name,
+                        "coefficient_mag": true_prism_smooth[
+                            pixel_id, det_index, basis_id
+                        ],
+                    }
+                )
+    pd.DataFrame(smooth_rows).to_csv(output_dir / "true_smooth_coeffs.csv", index=False)
     amp_rows = []
     for det_index, det_id in enumerate(detector_ids):
         for amp_id in range(config.n_amp):
@@ -769,7 +848,9 @@ def simulate_data(config: SimConfig) -> None:
             y = y_exp[star_id]
             amp_id = int(amp_id_from_x(x, nx=config.nx, n_amp=config.n_amp))
             xn, yn = normalized_xy(np.asarray([x]), np.asarray([y]), config)
-            smooth_delta = float((poly_basis(xn, yn) @ true_smooth_coeffs)[0])
+            smooth_delta = float(
+                (poly_basis(xn, yn) @ true_imaging_smooth[filt, det_index])[0]
+            )
             amp_delta = true_amp_offsets[det_index, amp_id]
             scalar_delta = true_zp[exp_id] + smooth_delta + amp_delta
             position_term = 1.0 + 0.12 * (x / (config.nx - 1.0) - 0.5)
@@ -919,7 +1000,12 @@ def simulate_data(config: SimConfig) -> None:
                 amp_id = int(amp_id_from_x(x, nx=config.nx, n_amp=config.n_amp))
                 amp_delta = true_amp_offsets[det_index, amp_id]
                 xn, yn = normalized_xy(x_valid, y_valid, config)
-                smooth_delta = poly_basis(xn, yn) @ true_smooth_coeffs
+                smooth_basis = poly_basis(xn, yn)
+                smooth_delta = np.einsum(
+                    "ij,ij->i",
+                    smooth_basis,
+                    true_prism_smooth[pixel_id, det_index],
+                )
                 position_term = 1.0 + 0.12 * (x_valid / (config.nx - 1.0) - 0.5)
                 position_term += 0.08 * (y_valid / (config.ny - 1.0) - 0.5)
                 ice_thickness = np.clip(

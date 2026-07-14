@@ -10,7 +10,9 @@ The model is intentionally not production-grade. It is a compact prototype for
 studying identifiability and degeneracies among stellar SEDs, detector-level
 passband shifts/widths, and a wavelength/thickness-dependent ice
 log-throughput surface. Sparse prism spectra add one sensitivity parameter per
-wavelength pixel while sharing the imaging amplifier gains.
+wavelength pixel. Imaging smooth fields vary by filter and detector, prism
+smooth fields vary by wavelength pixel and detector, and both data types share
+one set of detector/amplifier gains.
 """
 
 from __future__ import annotations
@@ -123,6 +125,8 @@ class FitConfig:
     sigma_zero_ice_surface_prior: float = 1e-4
     sigma_prism_response_prior: float = 0.20
     sigma_prism_response_smoothness: float = 0.01
+    sigma_smooth_prior: float = 0.02
+    sigma_prism_smoothness: float = 0.0001
     sigma_sed_coeff_update_prior_scale: float = 0.05
     sigma_amp_prior: float = 0.02
     sigma_amp_sum_constraint: float = 1e-4
@@ -192,7 +196,8 @@ class ModelState:
     ice_coeff: np.ndarray
     prism_response: np.ndarray
     zp: np.ndarray
-    smooth_coeff: np.ndarray
+    imaging_smooth_coeff: np.ndarray
+    prism_smooth_coeff: np.ndarray
     amp_offset: np.ndarray
 
 
@@ -657,7 +662,12 @@ def fit_initial_stellar_seds(data: DataBundle, config: FitConfig) -> ModelState:
     prism_response = np.zeros(data.prism_wave.size)
     n_exp = data.exposure_free_index.size
     zp = np.zeros(n_exp)
-    smooth_coeff = np.zeros(5)
+    imaging_smooth_coeff = np.zeros(
+        (data.filter_ids.size, data.detector_ids.size, 5)
+    )
+    prism_smooth_coeff = np.zeros(
+        (data.prism_wave.size, data.detector_ids.size, 5)
+    )
     amp_offset = np.zeros((data.detector_ids.size, int(data.sim_metadata.get("n_amp", 32))))
     state = ModelState(
         mag_norm,
@@ -667,7 +677,8 @@ def fit_initial_stellar_seds(data: DataBundle, config: FitConfig) -> ModelState:
         ice_coeff,
         prism_response,
         zp,
-        smooth_coeff,
+        imaging_smooth_coeff,
+        prism_smooth_coeff,
         amp_offset,
     )
     if not data.prism_measurements.empty and np.any(data.star_is_calibrator):
@@ -749,7 +760,12 @@ def evaluate_model_and_responses(
         weighted = sed * t_current
         denom = photon_count_integral(weighted, data.wave, axis=1)
         xn, yn = normalized_xy(x_pix[sl], y_pix[sl], nx=config.nx, ny=config.ny)
-        smooth = poly_basis(xn, yn) @ state.smooth_coeff
+        smooth_basis = poly_basis(xn, yn)
+        smooth = np.einsum(
+            "ij,ij->i",
+            smooth_basis,
+            state.imaging_smooth_coeff[filt, det],
+        )
         scalar = state.zp[exp_id] + smooth + state.amp_offset[det, amp]
         mag_model[sl] = counts_to_instrumental_mag(denom) + scalar
 
@@ -885,7 +901,12 @@ def evaluate_prism_model_and_responses(
     x_pix = data.prism_measurements["x"].to_numpy(float)
     y_pix = data.prism_measurements["y"].to_numpy(float)
     xn, yn = normalized_xy(x_pix, y_pix, nx=config.nx, ny=config.ny)
-    smooth = poly_basis(xn, yn) @ state.smooth_coeff
+    smooth_basis = poly_basis(xn, yn)
+    smooth = np.einsum(
+        "ij,ij->i",
+        smooth_basis,
+        state.prism_smooth_coeff[pixel, detector],
+    )
     scalar = (
         state.zp[data.prism_exposure_id]
         + smooth
@@ -927,7 +948,8 @@ def parameter_slices(data: DataBundle) -> dict[str, slice]:
     n_ice = data.ice_thickness_nodes.size * data.ice_loglam_nodes.size
     n_prism = data.prism_wave.size
     n_zp = data.free_exposure_ids.size
-    n_smooth = 5
+    n_imaging_smooth = data.filter_ids.size * data.detector_ids.size * 5
+    n_prism_smooth = data.prism_wave.size * data.detector_ids.size * 5
     n_amp = data.detector_ids.size * int(data.sim_metadata.get("n_amp", 32))
     start = 0
     slices = {}
@@ -945,8 +967,10 @@ def parameter_slices(data: DataBundle) -> dict[str, slice]:
     start += n_prism
     slices["zp"] = slice(start, start + n_zp)
     start += n_zp
-    slices["smooth"] = slice(start, start + n_smooth)
-    start += n_smooth
+    slices["imaging_smooth"] = slice(start, start + n_imaging_smooth)
+    start += n_imaging_smooth
+    slices["prism_smooth"] = slice(start, start + n_prism_smooth)
+    start += n_prism_smooth
     slices["amp"] = slice(start, start + n_amp)
     return slices
 
@@ -1006,7 +1030,13 @@ def build_sparse_system(
         if exposure_param >= 0:
             entries.append((slices["zp"].start + exposure_param, 1.0))
         for smooth_id in range(5):
-            entries.append((slices["smooth"].start + smooth_id, smooth_basis[obs_index, smooth_id]))
+            smooth_index = (filt * n_det + det) * 5 + smooth_id
+            entries.append(
+                (
+                    slices["imaging_smooth"].start + smooth_index,
+                    smooth_basis[obs_index, smooth_id],
+                )
+            )
         amp_index = det * config.n_amp + data.amp_id[obs_index]
         entries.append((slices["amp"].start + amp_index, 1.0))
 
@@ -1058,9 +1088,10 @@ def build_sparse_system(
             if exposure_param >= 0:
                 entries.append((slices["zp"].start + exposure_param, 1.0))
             for smooth_id in range(5):
+                smooth_index = (pixel * n_det + detector) * 5 + smooth_id
                 entries.append(
                     (
-                        slices["smooth"].start + smooth_id,
+                        slices["prism_smooth"].start + smooth_index,
                         prism_smooth_basis[obs_index, smooth_id],
                     )
                 )
@@ -1119,6 +1150,38 @@ def build_sparse_system(
         )
         rhs.append(-current_second_difference / config.sigma_prism_response_smoothness)
         row += 1
+
+    for flat_index, current in enumerate(state.imaging_smooth_coeff.ravel()):
+        rows.append(row)
+        cols.append(slices["imaging_smooth"].start + flat_index)
+        vals.append(1.0 / config.sigma_smooth_prior)
+        rhs.append(-current / config.sigma_smooth_prior)
+        row += 1
+
+    for flat_index, current in enumerate(state.prism_smooth_coeff.ravel()):
+        rows.append(row)
+        cols.append(slices["prism_smooth"].start + flat_index)
+        vals.append(1.0 / config.sigma_smooth_prior)
+        rhs.append(-current / config.sigma_smooth_prior)
+        row += 1
+
+    for pixel_id in range(1, data.prism_wave.size - 1):
+        for det_id in range(n_det):
+            for smooth_id in range(5):
+                for offset, coefficient in ((-1, 1.0), (0, -2.0), (1, 1.0)):
+                    flat_index = ((pixel_id + offset) * n_det + det_id) * 5 + smooth_id
+                    rows.append(row)
+                    cols.append(slices["prism_smooth"].start + flat_index)
+                    vals.append(coefficient / config.sigma_prism_smoothness)
+                current_second_difference = (
+                    state.prism_smooth_coeff[pixel_id - 1, det_id, smooth_id]
+                    - 2.0 * state.prism_smooth_coeff[pixel_id, det_id, smooth_id]
+                    + state.prism_smooth_coeff[pixel_id + 1, det_id, smooth_id]
+                )
+                rhs.append(
+                    -current_second_difference / config.sigma_prism_smoothness
+                )
+                row += 1
 
     # At exactly zero ice thickness, the ice perturbation is physically zero.
     # This removes a gauge freedom between the ice surface and stellar/passband
@@ -1191,7 +1254,12 @@ def apply_update(
     state.ice_coeff += damping * theta[slices["ice"]]
     state.prism_response += damping * theta[slices["prism_response"]]
     state.zp[data.free_exposure_ids] += damping * theta[slices["zp"]]
-    state.smooth_coeff += damping * theta[slices["smooth"]]
+    state.imaging_smooth_coeff += damping * theta[slices["imaging_smooth"]].reshape(
+        n_filter, n_det, 5
+    )
+    state.prism_smooth_coeff += damping * theta[slices["prism_smooth"]].reshape(
+        data.prism_wave.size, n_det, 5
+    )
     state.amp_offset += damping * theta[slices["amp"]].reshape(n_det, config.n_amp)
 
 
@@ -1205,7 +1273,8 @@ def copy_model_state(state: ModelState) -> ModelState:
         ice_coeff=state.ice_coeff.copy(),
         prism_response=state.prism_response.copy(),
         zp=state.zp.copy(),
-        smooth_coeff=state.smooth_coeff.copy(),
+        imaging_smooth_coeff=state.imaging_smooth_coeff.copy(),
+        prism_smooth_coeff=state.prism_smooth_coeff.copy(),
         amp_offset=state.amp_offset.copy(),
     )
 
@@ -1225,22 +1294,71 @@ def evaluate_smooth_field(
     return values.reshape(np.shape(xn))
 
 
-def smooth_fields_on_grid(
-    data: DataBundle, state: ModelState, config: FitConfig, n_grid: int = 120
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-    """Evaluate true, fitted, and residual smooth fields on a detector grid."""
+def make_smooth_truth_arrays(
+    data: DataBundle,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Load imaging and prism smooth-field truth into model-shaped arrays."""
     if data.true_smooth_coeffs is None:
-        return None
-    true_coeff = data.true_smooth_coeffs["coefficient_mag"].to_numpy(float)
-    if true_coeff.size != state.smooth_coeff.size:
+        return None, None
+    table = data.true_smooth_coeffs
+    imaging = np.zeros((data.filter_ids.size, data.detector_ids.size, 5))
+    prism = np.zeros((data.prism_wave.size, data.detector_ids.size, 5))
+    basis_lookup = {name: i for i, name in enumerate(["x", "y", "x2", "xy", "y2"])}
+    filter_lookup = {int(value): i for i, value in enumerate(data.filter_ids)}
+    detector_lookup = {int(value): i for i, value in enumerate(data.detector_ids)}
+
+    if "measurement_type" not in table.columns:
+        coeff = table["coefficient_mag"].to_numpy(float)
+        if coeff.size == 5:
+            imaging[:] = coeff
+            prism[:] = coeff
+            return imaging, prism
+        return None, None
+
+    for row in table.itertuples(index=False):
+        det = detector_lookup.get(int(row.detector_id))
+        basis_id = basis_lookup.get(str(row.basis_name))
+        if det is None or basis_id is None:
+            continue
+        if str(row.measurement_type) == "imaging":
+            filt = filter_lookup.get(int(row.filter_id))
+            if filt is not None:
+                imaging[filt, det, basis_id] = float(row.coefficient_mag)
+        elif str(row.measurement_type) == "prism":
+            pixel = int(row.wavelength_pixel_id)
+            if 0 <= pixel < data.prism_wave.size:
+                prism[pixel, det, basis_id] = float(row.coefficient_mag)
+    return imaging, prism
+
+
+def imaging_smooth_fields_on_grid(
+    data: DataBundle,
+    state: ModelState,
+    config: FitConfig,
+    detector_index: int,
+    n_grid: int = 100,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Evaluate all imaging-filter smooth fields for one detector."""
+    true_imaging, _ = make_smooth_truth_arrays(data)
+    if true_imaging is None:
         return None
     x_grid = np.linspace(0.0, config.nx - 1.0, n_grid)
     y_grid = np.linspace(0.0, config.ny - 1.0, n_grid)
     xx, yy = np.meshgrid(x_grid, y_grid)
-    true_field = evaluate_smooth_field(true_coeff, xx, yy, config)
-    fit_field = evaluate_smooth_field(state.smooth_coeff, xx, yy, config)
+    true_field = np.stack(
+        [
+            evaluate_smooth_field(coeff, xx, yy, config)
+            for coeff in true_imaging[:, detector_index]
+        ]
+    )
+    fit_field = np.stack(
+        [
+            evaluate_smooth_field(coeff, xx, yy, config)
+            for coeff in state.imaging_smooth_coeff[:, detector_index]
+        ]
+    )
     residual_field = fit_field - true_field
-    residual_field -= np.mean(residual_field)
+    residual_field -= np.mean(residual_field, axis=(1, 2), keepdims=True)
     return xx, yy, true_field, fit_field, residual_field
 
 
@@ -1249,7 +1367,14 @@ def evaluate_scalar_terms(data: DataBundle, state: ModelState, config: FitConfig
     x_pix = data.measurements["x"].to_numpy(float)
     y_pix = data.measurements["y"].to_numpy(float)
     xn, yn = normalized_xy(x_pix, y_pix, nx=config.nx, ny=config.ny)
-    smooth = poly_basis(xn, yn) @ state.smooth_coeff
+    smooth_basis = poly_basis(xn, yn)
+    smooth = np.einsum(
+        "ij,ij->i",
+        smooth_basis,
+        state.imaging_smooth_coeff[
+            data.filter_param_id, data.detector_param_id
+        ],
+    )
     return (
         state.zp[data.exposure_id]
         + smooth
@@ -1305,7 +1430,14 @@ def evaluate_prism_scalar_terms(
     x_pix = data.prism_measurements["x"].to_numpy(float)
     y_pix = data.prism_measurements["y"].to_numpy(float)
     xn, yn = normalized_xy(x_pix, y_pix, nx=config.nx, ny=config.ny)
-    smooth = poly_basis(xn, yn) @ state.smooth_coeff
+    smooth_basis = poly_basis(xn, yn)
+    smooth = np.einsum(
+        "ij,ij->i",
+        smooth_basis,
+        state.prism_smooth_coeff[
+            data.prism_pixel_id, data.prism_detector_param_id
+        ],
+    )
     return (
         state.zp[data.prism_exposure_id]
         + smooth
@@ -1680,11 +1812,50 @@ def save_outputs(
     pd.DataFrame(zp_rows).to_csv(output_dir / "fit_exposure_zeropoints.csv", index=False)
 
     smooth_rows = []
-    for smooth_id, name in enumerate(["x", "y", "x2", "xy", "y2"]):
-        row = {"basis_name": name, "coefficient_mag": state.smooth_coeff[smooth_id]}
-        if param_sigma is not None and slices is not None:
-            row["coefficient_mag_sigma"] = param_sigma[slices["smooth"].start + smooth_id]
-        smooth_rows.append(row)
+    basis_names = ["x", "y", "x2", "xy", "y2"]
+    n_det = data.detector_ids.size
+    for filt_i, filt in enumerate(data.filter_ids):
+        for det_i, det in enumerate(data.detector_ids):
+            for smooth_id, name in enumerate(basis_names):
+                flat_index = (filt_i * n_det + det_i) * 5 + smooth_id
+                row = {
+                    "measurement_type": "imaging",
+                    "filter_id": filt,
+                    "filter_name": data.filter_names[filt_i],
+                    "wavelength_pixel_id": np.nan,
+                    "wavelength_um": np.nan,
+                    "detector_id": det,
+                    "basis_name": name,
+                    "coefficient_mag": state.imaging_smooth_coeff[
+                        filt_i, det_i, smooth_id
+                    ],
+                }
+                if param_sigma is not None and slices is not None:
+                    row["coefficient_mag_sigma"] = param_sigma[
+                        slices["imaging_smooth"].start + flat_index
+                    ]
+                smooth_rows.append(row)
+    for pixel_id, wavelength in enumerate(data.prism_wave):
+        for det_i, det in enumerate(data.detector_ids):
+            for smooth_id, name in enumerate(basis_names):
+                flat_index = (pixel_id * n_det + det_i) * 5 + smooth_id
+                row = {
+                    "measurement_type": "prism",
+                    "filter_id": np.nan,
+                    "filter_name": "PRISM",
+                    "wavelength_pixel_id": pixel_id,
+                    "wavelength_um": wavelength,
+                    "detector_id": det,
+                    "basis_name": name,
+                    "coefficient_mag": state.prism_smooth_coeff[
+                        pixel_id, det_i, smooth_id
+                    ],
+                }
+                if param_sigma is not None and slices is not None:
+                    row["coefficient_mag_sigma"] = param_sigma[
+                        slices["prism_smooth"].start + flat_index
+                    ]
+                smooth_rows.append(row)
     pd.DataFrame(smooth_rows).to_csv(output_dir / "fit_smooth_coeffs.csv", index=False)
 
     amp_rows = []
@@ -1863,9 +2034,17 @@ def print_diagnostics(
                 true_zp[exp_id] = row["zp_mag"]
         print(f"Exposure ZP RMS error: {rms(state.zp - true_zp):.6f} mag")
     if data.true_smooth_coeffs is not None:
-        true_smooth = data.true_smooth_coeffs["coefficient_mag"].to_numpy(float)
-        if true_smooth.size == state.smooth_coeff.size:
-            print(f"Smooth coefficient RMS error: {rms(state.smooth_coeff - true_smooth):.6f} mag")
+        true_imaging_smooth, true_prism_smooth = make_smooth_truth_arrays(data)
+        if true_imaging_smooth is not None:
+            print(
+                "Imaging smooth-coefficient RMS error: "
+                f"{rms(state.imaging_smooth_coeff - true_imaging_smooth):.6f} mag"
+            )
+        if true_prism_smooth is not None and true_prism_smooth.size:
+            print(
+                "Prism smooth-coefficient RMS error: "
+                f"{rms(state.prism_smooth_coeff - true_prism_smooth):.6f} mag"
+            )
     if data.true_amp_offsets is not None:
         true_amp = np.zeros_like(state.amp_offset)
         for _, row in data.true_amp_offsets.iterrows():
@@ -1950,9 +2129,6 @@ def make_plots(
         plt.close()
 
     plt.figure(figsize=(6.5, 4.5))
-    plt.plot(
-        summary["iteration"], summary["rms_residual"], marker="o", label="combined"
-    )
     plt.plot(
         summary["iteration"],
         summary["imaging_rms_residual"],
@@ -2203,47 +2379,175 @@ def make_plots(
         plt.savefig(output_dir / "amp_offset_comparison.png", dpi=160)
         plt.close()
 
-    smooth_grid = smooth_fields_on_grid(data, state, config, n_grid=120)
-    if smooth_grid is not None:
+    true_imaging_smooth, true_prism_smooth = make_smooth_truth_arrays(data)
+    for det_i, det_id in enumerate(data.detector_ids):
+        smooth_grid = imaging_smooth_fields_on_grid(
+            data, state, config, detector_index=det_i, n_grid=90
+        )
+        if smooth_grid is None:
+            continue
         _, _, true_field, fit_field, residual_field = smooth_grid
         image_kwargs = {
             "origin": "lower",
             "extent": [0, config.nx - 1, 0, config.ny - 1],
             "aspect": "equal",
+            "cmap": "coolwarm",
         }
-        plt.figure(figsize=(6.5, 5.5))
-        im = plt.imshow(true_field, **image_kwargs)
-        plt.colorbar(im, label="mag")
-        plt.xlabel("x pixel")
-        plt.ylabel("y pixel")
-        plt.title("True smooth field")
-        plt.tight_layout()
-        plt.savefig(output_dir / "smooth_field_true.png", dpi=160)
-        plt.close()
-
-        plt.figure(figsize=(6.5, 5.5))
-        im = plt.imshow(fit_field, **image_kwargs)
-        plt.colorbar(im, label="mag")
-        plt.xlabel("x pixel")
-        plt.ylabel("y pixel")
-        plt.title("Recovered smooth field")
-        plt.tight_layout()
-        plt.savefig(output_dir / "smooth_field_recovered.png", dpi=160)
-        plt.close()
-
-        plt.figure(figsize=(6.5, 5.5))
-        vmax = np.max(np.abs(residual_field))
-        vmax = max(vmax, 1e-9)
-        im = plt.imshow(
-            residual_field, vmin=-vmax, vmax=vmax, cmap="coolwarm", **image_kwargs
+        common_vmax = max(
+            np.max(np.abs(true_field)), np.max(np.abs(fit_field)), 1e-9
         )
-        plt.colorbar(im, label="mag")
-        plt.xlabel("x pixel")
-        plt.ylabel("y pixel")
-        plt.title("Recovered - true smooth field, mean removed")
-        plt.tight_layout()
-        plt.savefig(output_dir / "smooth_field_residual.png", dpi=160)
-        plt.close()
+        residual_vmax = max(np.max(np.abs(residual_field)), 1e-9)
+        suffix = f"_det{int(det_id):02d}" if data.detector_ids.size > 1 else ""
+        for fields, suptitle, filename, vmax in (
+            (
+                true_field,
+                f"True imaging smooth fields, detector {int(det_id):02d}",
+                f"smooth_field_true{suffix}.png",
+                common_vmax,
+            ),
+            (
+                fit_field,
+                f"Recovered imaging smooth fields, detector {int(det_id):02d}",
+                f"smooth_field_recovered{suffix}.png",
+                common_vmax,
+            ),
+            (
+                residual_field,
+                f"Recovered - true imaging fields, detector {int(det_id):02d}",
+                f"smooth_field_residual{suffix}.png",
+                residual_vmax,
+            ),
+        ):
+            n_col = 3
+            n_row = int(np.ceil(data.filter_ids.size / n_col))
+            fig, axes = plt.subplots(
+                n_row, n_col, figsize=(4.0 * n_col, 3.6 * n_row), squeeze=False
+            )
+            images = []
+            for filt_i, ax in enumerate(axes.ravel()):
+                if filt_i >= data.filter_ids.size:
+                    ax.axis("off")
+                    continue
+                plot_row, plot_col = divmod(filt_i, n_col)
+                images.append(
+                    ax.imshow(fields[filt_i], vmin=-vmax, vmax=vmax, **image_kwargs)
+                )
+                ax.set_title(data.filter_names[filt_i])
+                if plot_row == n_row - 1:
+                    ax.set_xlabel("x pixel")
+                if plot_col == 0:
+                    ax.set_ylabel("y pixel")
+            colorbar_ax = fig.add_axes([0.915, 0.15, 0.018, 0.68])
+            fig.colorbar(images[0], cax=colorbar_ax, label="mag")
+            fig.suptitle(suptitle)
+            fig.subplots_adjust(
+                left=0.06,
+                right=0.89,
+                bottom=0.08,
+                top=0.90,
+                wspace=0.16,
+                hspace=0.30,
+            )
+            fig.savefig(output_dir / filename, dpi=160)
+            plt.close(fig)
+
+        if true_prism_smooth is not None and data.prism_wave.size:
+            basis_names = ["x", "y", "x2", "xy", "y2"]
+            fig, axes = plt.subplots(
+                2,
+                5,
+                figsize=(18, 7),
+                sharex="col",
+                squeeze=False,
+            )
+            for smooth_id, basis_name in enumerate(basis_names):
+                true_coeff = true_prism_smooth[:, det_i, smooth_id]
+                fit_coeff = state.prism_smooth_coeff[:, det_i, smooth_id]
+                axes[0, smooth_id].plot(data.prism_wave, true_coeff, label="true")
+                axes[0, smooth_id].plot(data.prism_wave, fit_coeff, label="fit")
+                axes[0, smooth_id].set_title(basis_name)
+                axes[0, smooth_id].set_ylabel("Coefficient [mag]")
+                axes[1, smooth_id].plot(
+                    data.prism_wave, fit_coeff - true_coeff, color="tab:red"
+                )
+                axes[1, smooth_id].axhline(0.0, color="0.3", linewidth=1)
+                axes[1, smooth_id].set_xlabel("Wavelength [um]")
+                axes[1, smooth_id].set_ylabel("Fit - true [mag]")
+            axes[0, 0].legend()
+            fig.suptitle(
+                f"Prism smooth-field coefficient recovery, detector {int(det_id):02d}"
+            )
+            fig.tight_layout()
+            fig.savefig(
+                output_dir / f"prism_smooth_coefficients{suffix}.png", dpi=160
+            )
+            plt.close(fig)
+
+            sample_pixels = np.unique(
+                np.linspace(0, data.prism_wave.size - 1, 4).astype(int)
+            )
+            x_grid = np.linspace(0.0, config.nx - 1.0, 80)
+            y_grid = np.linspace(0.0, config.ny - 1.0, 80)
+            xx, yy = np.meshgrid(x_grid, y_grid)
+            sample_true = np.stack(
+                [
+                    evaluate_smooth_field(
+                        true_prism_smooth[pixel, det_i], xx, yy, config
+                    )
+                    for pixel in sample_pixels
+                ]
+            )
+            sample_fit = np.stack(
+                [
+                    evaluate_smooth_field(
+                        state.prism_smooth_coeff[pixel, det_i], xx, yy, config
+                    )
+                    for pixel in sample_pixels
+                ]
+            )
+            sample_residual = sample_fit - sample_true
+            sample_residual -= np.mean(
+                sample_residual, axis=(1, 2), keepdims=True
+            )
+            common_vmax = max(
+                np.max(np.abs(sample_true)), np.max(np.abs(sample_fit)), 1e-9
+            )
+            residual_vmax = max(np.max(np.abs(sample_residual)), 1e-9)
+            fig, axes = plt.subplots(
+                3, sample_pixels.size, figsize=(4.0 * sample_pixels.size, 10.5)
+            )
+            row_images = []
+            for col, pixel in enumerate(sample_pixels):
+                for row, (field, vmax, label) in enumerate(
+                    (
+                        (sample_true[col], common_vmax, "True"),
+                        (sample_fit[col], common_vmax, "Fit"),
+                        (sample_residual[col], residual_vmax, "Fit - true"),
+                    )
+                ):
+                    im = axes[row, col].imshow(
+                        field, vmin=-vmax, vmax=vmax, **image_kwargs
+                    )
+                    axes[row, col].set_title(
+                        f"{label}, {data.prism_wave[pixel]:.3f} um"
+                    )
+                    axes[row, col].set_xlabel("x pixel")
+                    axes[row, col].set_ylabel("y pixel")
+                    if col == sample_pixels.size - 1:
+                        row_images.append(im)
+            for row, im in enumerate(row_images):
+                colorbar_ax = fig.add_axes(
+                    [0.92, 0.69 - 0.30 * row, 0.012, 0.20]
+                )
+                fig.colorbar(im, cax=colorbar_ax, label="mag")
+            fig.suptitle(
+                f"Prism smooth-field samples, detector {int(det_id):02d}"
+            )
+            fig.subplots_adjust(
+                left=0.05, right=0.89, bottom=0.06, top=0.92, wspace=0.28, hspace=0.32
+            )
+            fig.savefig(output_dir / f"prism_smooth_field_samples{suffix}.png", dpi=160)
+            plt.close(fig)
 
     if true_ice is not None:
         log_wave, thickness_grid, true_surface = ice_surface_on_grid(data, true_ice)
