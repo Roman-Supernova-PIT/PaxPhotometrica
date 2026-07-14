@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""Simulate Roman-like WFI scalar and chromatic calibration photometry.
+"""Simulate Roman-like WFI imaging and prism calibration measurements.
 
 This simulator combines the scalar ubercalibration toy model with chromatic
 calibration: exposure zeropoints, smooth focal-plane terms, amplifier offsets,
 small passband shifts, passband width changes, and ice-induced
 wavelength/thickness-dependent throughput changes.
+
+A configurable fraction of stars also receives vertically dispersed prism
+spectra. Prism wavelength pixels share the imaging amplifier gains and scalar
+focal-plane model while carrying their own wavelength-dependent response.
 
 Throughput perturbations are modeled in log-throughput space because small
 multiplicative throughput changes then add linearly. Observations are still
@@ -54,17 +58,23 @@ class SimConfig:
     wave_max: float = 2.30
     n_wave: int = 2000
     passband_file: str = "passbands.txt"
+    prism_wavelength_file: str = "prism wavelengths"
     sed_basis_path: str = "bosz_logflux_empca_basis.npz"
     ice_loglam_nodes_file: str = "ice_loglam_nodes.txt"
     n_ice_thickness_nodes: int = 5
     ice_thickness_min: float = 0.0
     ice_thickness_max: float = 1.2
     phot_sigma_mag: float = 0.005
+    prism_sigma_mag: float = 0.015
     output_dir: str = "passband_sim_outputs"
     detection_fraction: float = 0.92
+    n_prism_exp: int = 4
+    prism_star_fraction: float = 0.01
+    prism_detection_fraction: float = 0.95
     dither_sigma_pix: float = 500.0
     zp_sigma_mag: float = 0.01
     amp_sigma_mag: float = 0.003
+    prism_response_sigma_mag: float = 0.015
     shift_sigma_um: float = 0.001
     width_sigma: float = 0.01
     mode_smooth_sigma_pix: float = 4.0
@@ -411,6 +421,99 @@ def interpolate_ice_surface(
     return w_lo * surface_lo + w_hi * surface_hi
 
 
+def interpolate_ice_surface_points(
+    node_values: np.ndarray,
+    loglam_nodes: np.ndarray,
+    thickness_nodes: np.ndarray,
+    wavelength_um: np.ndarray,
+    thickness: np.ndarray,
+) -> np.ndarray:
+    """Evaluate the rectangular ice spline at paired wavelength/thickness points."""
+    log_wave = np.log10(np.asarray(wavelength_um, dtype=float))
+    thickness = np.asarray(thickness, dtype=float)
+
+    lam_hi = np.searchsorted(loglam_nodes, log_wave, side="right")
+    lam_hi = np.clip(lam_hi, 1, loglam_nodes.size - 1)
+    lam_lo = lam_hi - 1
+    lam_weight_hi = (log_wave - loglam_nodes[lam_lo]) / (
+        loglam_nodes[lam_hi] - loglam_nodes[lam_lo]
+    )
+    lam_weight_hi = np.clip(lam_weight_hi, 0.0, 1.0)
+    lam_weight_lo = 1.0 - lam_weight_hi
+
+    t = np.clip(thickness, thickness_nodes[0], thickness_nodes[-1])
+    thick_hi = np.searchsorted(thickness_nodes, t, side="right")
+    thick_hi = np.clip(thick_hi, 1, thickness_nodes.size - 1)
+    thick_lo = thick_hi - 1
+    thick_weight_hi = (t - thickness_nodes[thick_lo]) / (
+        thickness_nodes[thick_hi] - thickness_nodes[thick_lo]
+    )
+    thick_weight_lo = 1.0 - thick_weight_hi
+
+    return (
+        thick_weight_lo
+        * (
+            lam_weight_lo * node_values[thick_lo, lam_lo]
+            + lam_weight_hi * node_values[thick_lo, lam_hi]
+        )
+        + thick_weight_hi
+        * (
+            lam_weight_lo * node_values[thick_hi, lam_lo]
+            + lam_weight_hi * node_values[thick_hi, lam_hi]
+        )
+    )
+
+
+def read_prism_wavelength_grid(
+    config: SimConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Read prism pixel centers and construct finite wavelength-bin edges.
+
+    The supplied file contains one wavelength per detector pixel along the
+    spectrum. Values larger than 100 are interpreted as Angstroms and converted
+    to microns. Midpoints between adjacent centers define the bin edges.
+    """
+    path = Path(config.prism_wavelength_file)
+    if not path.exists():
+        raise FileNotFoundError(f"Missing prism wavelength file: {path}")
+    wavelength = np.asarray(np.loadtxt(path, comments="#", ndmin=1), dtype=float).ravel()
+    wavelength = wavelength[np.isfinite(wavelength)]
+    if wavelength.size < 2 or np.any(np.diff(wavelength) <= 0.0):
+        raise ValueError("Prism wavelengths must contain at least two increasing values")
+    if np.nanmedian(wavelength) > 100.0:
+        wavelength = wavelength * 1.0e-4
+    if wavelength.min() < config.wave_min or wavelength.max() > config.wave_max:
+        raise ValueError(
+            "Prism wavelength grid must lie inside the configured SED wavelength range"
+        )
+
+    edges = np.empty(wavelength.size + 1)
+    edges[1:-1] = 0.5 * (wavelength[:-1] + wavelength[1:])
+    edges[0] = wavelength[0] - 0.5 * (wavelength[1] - wavelength[0])
+    edges[-1] = wavelength[-1] + 0.5 * (wavelength[-1] - wavelength[-2])
+    bin_width = np.diff(edges)
+
+    # A smooth, dimensionless nominal prism envelope. Its absolute normalization
+    # is arbitrary because the wavelength-by-wavelength calibration is fitted.
+    phase = np.linspace(0.0, np.pi, wavelength.size)
+    nominal_throughput = 0.55 + 0.40 * np.sin(phase) ** 0.7
+    return wavelength, edges[:-1], edges[1:], nominal_throughput
+
+
+def make_true_prism_response(
+    wavelength_um: np.ndarray, sigma_mag: float, rng: np.random.Generator
+) -> np.ndarray:
+    """Generate a smooth wavelength-dependent prism sensitivity correction."""
+    u = (wavelength_um - wavelength_um.min()) / np.ptp(wavelength_um)
+    response = sigma_mag * (
+        0.70 * np.sin(2.0 * np.pi * (1.3 * u + 0.08))
+        + 0.35 * np.cos(2.0 * np.pi * 3.1 * u)
+        + 0.25 * (u - 0.5)
+    )
+    response += gaussian_smooth_1d(rng.normal(0.0, 0.12 * sigma_mag, u.size), 2.0)
+    return response
+
+
 def write_passband_files(
     output_dir: Path,
     wave: np.ndarray,
@@ -498,11 +601,38 @@ def simulate_data(config: SimConfig) -> None:
     loglam_nodes = read_ice_loglam_nodes(config, wave)
     thickness_nodes = make_ice_thickness_nodes(config)
     true_ice_node_values = make_true_ice_spline_values(loglam_nodes, thickness_nodes)
+    (
+        prism_wave,
+        prism_bin_lower,
+        prism_bin_upper,
+        prism_nominal_throughput,
+    ) = read_prism_wavelength_grid(config)
+    prism_bin_width = prism_bin_upper - prism_bin_lower
+    true_prism_response = make_true_prism_response(
+        prism_wave, config.prism_response_sigma_mag, rng
+    )
 
     write_passband_files(
         output_dir, wave, passbands, phi_shift, phi_width, filter_names
     )
     write_ice_spline_files(output_dir, loglam_nodes, thickness_nodes, true_ice_node_values)
+    pd.DataFrame(
+        {
+            "wavelength_pixel_id": np.arange(prism_wave.size, dtype=int),
+            "wavelength_um": prism_wave,
+            "bin_lower_um": prism_bin_lower,
+            "bin_upper_um": prism_bin_upper,
+            "bin_width_um": prism_bin_width,
+            "nominal_throughput": prism_nominal_throughput,
+        }
+    ).to_csv(output_dir / "nominal_prism.csv", index=False)
+    pd.DataFrame(
+        {
+            "wavelength_pixel_id": np.arange(prism_wave.size, dtype=int),
+            "wavelength_um": prism_wave,
+            "prism_response_mag": true_prism_response,
+        }
+    ).to_csv(output_dir / "true_prism_response.csv", index=False)
 
     detector_ids = np.arange(1, config.n_det + 1, dtype=int)
     star_detector_index = np.arange(config.n_star, dtype=int) % config.n_det
@@ -554,8 +684,11 @@ def simulate_data(config: SimConfig) -> None:
             )
     pd.DataFrame(pass_rows).to_csv(output_dir / "true_passband_params.csv", index=False)
 
-    true_zp = rng.normal(0.0, config.zp_sigma_mag, size=config.n_exp)
+    n_total_exp = config.n_exp + config.n_prism_exp
+    true_zp = rng.normal(0.0, config.zp_sigma_mag, size=n_total_exp)
     true_zp[0] = 0.0
+    if config.n_prism_exp > 0:
+        true_zp[config.n_exp] = 0.0
     true_smooth_coeffs = np.asarray(config.true_smooth_coeffs, dtype=float)
     true_amp_offsets = rng.normal(
         0.0, config.amp_sigma_mag, size=(config.n_det, config.n_amp)
@@ -563,7 +696,14 @@ def simulate_data(config: SimConfig) -> None:
     true_amp_offsets -= true_amp_offsets.mean(axis=1, keepdims=True)
 
     pd.DataFrame(
-        {"exposure_id": np.arange(config.n_exp, dtype=int), "zp_mag": true_zp}
+        {
+            "exposure_id": np.arange(n_total_exp, dtype=int),
+            "measurement_type": np.where(
+                np.arange(n_total_exp) < config.n_exp, "imaging", "prism"
+            ),
+            "is_reference": np.isin(np.arange(n_total_exp), [0, config.n_exp]),
+            "zp_mag": true_zp,
+        }
     ).to_csv(output_dir / "true_exposure_zeropoints.csv", index=False)
     pd.DataFrame(
         {
@@ -696,6 +836,163 @@ def simulate_data(config: SimConfig) -> None:
 
     pd.DataFrame(rows).to_csv(output_dir / "measurements.csv", index=False)
 
+    # Prism traces are vertical. Every wavelength pixel in one spectrum has the
+    # same detector x coordinate and therefore the same amplifier ID; wavelength
+    # increases along y. Dithers can move the whole trace to another amplifier
+    # in a later exposure, which ties the prism and imaging amplifier solutions.
+    n_random_prism_star = min(
+        config.n_star,
+        max(1, int(round(config.prism_star_fraction * config.n_star))),
+    )
+    non_calibrator_ids = np.nonzero(~is_calibrator)[0]
+    n_random_noncal = min(
+        non_calibrator_ids.size,
+        max(0, n_random_prism_star - calibrator_ids.size),
+    )
+    random_prism_ids = (
+        rng.choice(non_calibrator_ids, size=n_random_noncal, replace=False)
+        if n_random_noncal > 0
+        else np.asarray([], dtype=int)
+    )
+    prism_star_ids = np.unique(np.r_[calibrator_ids, random_prism_ids]).astype(int)
+
+    sed_prism = np.vstack(
+        [np.interp(prism_wave, wave, sed_all[star_id]) for star_id in range(config.n_star)]
+    )
+    prism_pixel_offset = np.arange(prism_wave.size, dtype=float)
+    prism_pixel_offset -= 0.5 * (prism_wave.size - 1.0)
+    prism_rows = []
+    prism_obs_id = 0
+    spectrum_id = 0
+    if config.n_prism_exp > 0:
+        prism_dither_dx = rng.normal(0.0, config.dither_sigma_pix, config.n_prism_exp)
+        prism_dither_dy = rng.normal(0.0, config.dither_sigma_pix, config.n_prism_exp)
+        prism_dither_dx[0] = 0.0
+        prism_dither_dy[0] = 0.0
+        prism_rotation = np.asarray(config.rotation_angles_deg, dtype=float)[
+            np.arange(config.n_prism_exp) % len(config.rotation_angles_deg)
+        ]
+        prism_rotation[0] = 0.0
+        prism_phase = np.linspace(0.35, 1.65 * np.pi, config.n_prism_exp)
+        prism_exposure_ice = 0.55 + 0.30 * np.sin(prism_phase)
+        prism_exposure_ice += rng.normal(0.0, 0.05, config.n_prism_exp)
+        prism_exposure_ice = np.clip(
+            prism_exposure_ice, config.ice_thickness_min, config.ice_thickness_max
+        )
+        # The absolute prism reference exposure is an ice-free standard-star
+        # observation. Later exposures span nonzero thickness and determine the
+        # interference surface relative to this intrinsic prism response.
+        prism_exposure_ice[0] = config.ice_thickness_min
+
+        for prism_exp_index in range(config.n_prism_exp):
+            exp_id = config.n_exp + prism_exp_index
+            x_anchor, y_anchor = apply_exposure_transform(
+                star_base_x,
+                star_base_y,
+                prism_dither_dx[prism_exp_index],
+                prism_dither_dy[prism_exp_index],
+                prism_rotation[prism_exp_index],
+                config,
+            )
+            for star_id in prism_star_ids:
+                if (
+                    not is_calibrator[star_id]
+                    and rng.random() >= config.prism_detection_fraction
+                ):
+                    continue
+                x = float(x_anchor[star_id])
+                y = y_anchor[star_id] + prism_pixel_offset
+                valid = (
+                    (x >= 0.0)
+                    & (x < config.nx)
+                    & (y >= 0.0)
+                    & (y < config.ny)
+                )
+                if not np.any(valid):
+                    continue
+
+                pixel_id = np.nonzero(valid)[0]
+                y_valid = y[valid]
+                x_valid = np.full(pixel_id.size, x)
+                det_index = star_detector_index[star_id]
+                det_id = star_detector_id[star_id]
+                amp_id = int(amp_id_from_x(x, nx=config.nx, n_amp=config.n_amp))
+                amp_delta = true_amp_offsets[det_index, amp_id]
+                xn, yn = normalized_xy(x_valid, y_valid, config)
+                smooth_delta = poly_basis(xn, yn) @ true_smooth_coeffs
+                position_term = 1.0 + 0.12 * (x_valid / (config.nx - 1.0) - 0.5)
+                position_term += 0.08 * (y_valid / (config.ny - 1.0) - 0.5)
+                ice_thickness = np.clip(
+                    prism_exposure_ice[prism_exp_index] * position_term,
+                    config.ice_thickness_min,
+                    config.ice_thickness_max,
+                )
+                ice_logt = interpolate_ice_surface_points(
+                    true_ice_node_values,
+                    loglam_nodes,
+                    thickness_nodes,
+                    prism_wave[pixel_id],
+                    ice_thickness,
+                )
+                response_mag = true_prism_response[pixel_id]
+                response_factor = 10.0 ** (-0.4 * response_mag)
+                source_count = (
+                    sed_prism[star_id, pixel_id]
+                    * prism_nominal_throughput[pixel_id]
+                    * np.exp(ice_logt)
+                    * response_factor
+                    * prism_wave[pixel_id]
+                    * prism_bin_width[pixel_id]
+                )
+                ab_count = (
+                    ab_f_lambda_per_micron(prism_wave[pixel_id])
+                    * prism_nominal_throughput[pixel_id]
+                    * np.exp(ice_logt)
+                    * response_factor
+                    * prism_wave[pixel_id]
+                    * prism_bin_width[pixel_id]
+                )
+                true_ab_mag = -2.5 * np.log10(
+                    np.maximum(source_count, 1e-300) / np.maximum(ab_count, 1e-300)
+                )
+                scalar_delta = true_zp[exp_id] + smooth_delta + amp_delta
+                mag_true = counts_to_instrumental_mag(source_count) + scalar_delta
+                mag_obs = mag_true + rng.normal(0.0, config.prism_sigma_mag, pixel_id.size)
+
+                for local, prism_pixel_id in enumerate(pixel_id):
+                    prism_rows.append(
+                        {
+                            "prism_obs_id": prism_obs_id,
+                            "spectrum_id": spectrum_id,
+                            "star_id": int(star_id),
+                            "exposure_id": exp_id,
+                            "epoch_id": exp_id,
+                            "detector_id": int(det_id),
+                            "amp_id": amp_id,
+                            "wavelength_pixel_id": int(prism_pixel_id),
+                            "wavelength_um": prism_wave[prism_pixel_id],
+                            "bin_width_um": prism_bin_width[prism_pixel_id],
+                            "x": x,
+                            "y": y_valid[local],
+                            "ice_thickness": ice_thickness[local],
+                            "mag_obs": mag_obs[local],
+                            "mag_unc": config.prism_sigma_mag,
+                            "mag_true_no_noise": mag_true[local],
+                            "true_ab_mag": true_ab_mag[local],
+                            "true_prism_response_mag": response_mag[local],
+                            "true_ice_logt": ice_logt[local],
+                            "true_zp_delta_mag": true_zp[exp_id],
+                            "true_smooth_delta_mag": smooth_delta[local],
+                            "true_amp_delta_mag": amp_delta,
+                            "true_scalar_delta_mag": scalar_delta[local],
+                            "is_spectrophotometric_standard": bool(is_calibrator[star_id]),
+                        }
+                    )
+                    prism_obs_id += 1
+                spectrum_id += 1
+
+    pd.DataFrame(prism_rows).to_csv(output_dir / "prism_measurements.csv", index=False)
+
     metadata = asdict(config)
     metadata["wave_min"] = float(wave.min())
     metadata["wave_max"] = float(wave.max())
@@ -719,6 +1016,15 @@ def simulate_data(config: SimConfig) -> None:
     metadata["n_ice_thickness_nodes"] = int(thickness_nodes.size)
     metadata["n_absolute_calibrator"] = int(n_calibrator)
     metadata["n_obs"] = len(rows)
+    metadata["prism_wavelength_input_unit"] = "Angstrom"
+    metadata["prism_wavelength_output_unit"] = "micron"
+    metadata["prism_trace_orientation"] = "vertical"
+    metadata["n_prism_wavelength_pixel"] = int(prism_wave.size)
+    metadata["n_prism_target_star"] = int(prism_star_ids.size)
+    metadata["n_prism_obs"] = len(prism_rows)
+    metadata["prism_reference_exposure_id"] = (
+        int(config.n_exp) if config.n_prism_exp > 0 else None
+    )
     with open(output_dir / "simulation_metadata.json", "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2, sort_keys=True)
 
@@ -730,9 +1036,16 @@ def simulate_data(config: SimConfig) -> None:
         loglam_nodes,
         thickness_nodes,
         true_ice_node_values,
+        prism_wave,
+        prism_nominal_throughput,
+        true_prism_response,
     )
 
     print(f"Saved {len(rows)} observations to {output_dir / 'measurements.csv'}")
+    print(
+        f"Saved {len(prism_rows)} prism pixels from {spectrum_id} spectra to "
+        f"{output_dir / 'prism_measurements.csv'}"
+    )
     print(f"Saved simulator products to {output_dir.resolve()}")
 
 
@@ -744,6 +1057,9 @@ def make_diagnostic_plots(
     loglam_nodes: np.ndarray,
     thickness_nodes: np.ndarray,
     true_ice_node_values: np.ndarray,
+    prism_wave: np.ndarray,
+    prism_nominal_throughput: np.ndarray,
+    true_prism_response: np.ndarray,
 ) -> None:
     plt.figure(figsize=(8, 4.5))
     for filt in range(passbands.shape[0]):
@@ -792,11 +1108,26 @@ def make_diagnostic_plots(
     plt.savefig(output_dir / "sim_true_ice_surface.png", dpi=160)
     plt.close()
 
+    fig, axes = plt.subplots(2, 1, figsize=(8, 7), sharex=True)
+    axes[0].plot(prism_wave, prism_nominal_throughput, color="tab:blue")
+    axes[0].set_ylabel("Nominal throughput")
+    axes[0].set_title("Toy Roman prism model")
+    axes[1].plot(prism_wave, true_prism_response, color="tab:orange")
+    axes[1].axhline(0.0, color="0.3", linewidth=1)
+    axes[1].set_xlabel("Wavelength [um]")
+    axes[1].set_ylabel("True response correction [mag]")
+    fig.tight_layout()
+    fig.savefig(output_dir / "sim_true_prism_response.png", dpi=160)
+    plt.close(fig)
+
 
 def parse_args() -> SimConfig:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", default=SimConfig.output_dir)
     parser.add_argument("--passband-file", default=SimConfig.passband_file)
+    parser.add_argument("--prism-wavelength-file", default=SimConfig.prism_wavelength_file)
+    parser.add_argument("--n-prism-exp", type=int, default=SimConfig.n_prism_exp)
+    parser.add_argument("--prism-star-fraction", type=float, default=SimConfig.prism_star_fraction)
     parser.add_argument("--sed-basis-path", default=SimConfig.sed_basis_path)
     parser.add_argument("--reference-filter-id", type=int, default=SimConfig.reference_filter_id)
     parser.add_argument("--n-absolute-calibrator", type=int, default=SimConfig.n_absolute_calibrator)
@@ -808,6 +1139,9 @@ def parse_args() -> SimConfig:
     return SimConfig(
         output_dir=args.output_dir,
         passband_file=args.passband_file,
+        prism_wavelength_file=args.prism_wavelength_file,
+        n_prism_exp=args.n_prism_exp,
+        prism_star_fraction=args.prism_star_fraction,
         sed_basis_path=args.sed_basis_path,
         reference_filter_id=args.reference_filter_id,
         n_absolute_calibrator=args.n_absolute_calibrator,

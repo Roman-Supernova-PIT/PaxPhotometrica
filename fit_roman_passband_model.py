@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fit a sparse linearized Roman-like WFI passband and ice calibration model.
+"""Fit a sparse Roman-like WFI imaging, passband, ice, and prism model.
 
 The simulator generates broadband magnitudes from linear flux integrals. This
 fitter iteratively linearizes those magnitudes around the current stellar SED,
@@ -9,7 +9,8 @@ updates, damps the update, and repeats.
 The model is intentionally not production-grade. It is a compact prototype for
 studying identifiability and degeneracies among stellar SEDs, detector-level
 passband shifts/widths, and a wavelength/thickness-dependent ice
-log-throughput surface.
+log-throughput surface. Sparse prism spectra add one sensitivity parameter per
+wavelength pixel while sharing the imaging amplifier gains.
 """
 
 from __future__ import annotations
@@ -112,14 +113,17 @@ class FitConfig:
     input_dir: str = "passband_sim_outputs"
     output_dir: str = "passband_fit_outputs"
     sed_basis_path: str = ""
-    n_iter: int = 5
+    n_iter: int = 8
     damping: float = 0.5
+    min_damping: float = 0.0078125
     max_stars: int | None = None
     sigma_shift_prior: float = 0.02
     sigma_width_prior: float = 0.05
     sigma_ice_prior: float = 0.10
     sigma_zero_ice_surface_prior: float = 1e-4
-    sigma_sed_coeff_update_prior_scale: float = 0.25
+    sigma_prism_response_prior: float = 0.20
+    sigma_prism_response_smoothness: float = 0.01
+    sigma_sed_coeff_update_prior_scale: float = 0.05
     sigma_amp_prior: float = 0.02
     sigma_amp_sum_constraint: float = 1e-4
     nx: int = 4096
@@ -142,6 +146,20 @@ class DataBundle:
     detector_param_id: np.ndarray
     star_param_id: np.ndarray
     amp_id: np.ndarray
+    prism_measurements: pd.DataFrame
+    prism_wave: np.ndarray
+    prism_bin_width: np.ndarray
+    prism_nominal_throughput: np.ndarray
+    prism_star_param_id: np.ndarray
+    prism_detector_param_id: np.ndarray
+    prism_exposure_id: np.ndarray
+    prism_amp_id: np.ndarray
+    prism_pixel_id: np.ndarray
+    prism_mean_log_flux: np.ndarray
+    prism_components: np.ndarray
+    prism_ice_loglam_basis: np.ndarray
+    free_exposure_ids: np.ndarray
+    exposure_free_index: np.ndarray
     star_is_calibrator: np.ndarray
     free_star_indices: np.ndarray
     free_star_index: np.ndarray
@@ -161,6 +179,7 @@ class DataBundle:
     true_exposure_zeropoints: pd.DataFrame | None
     true_smooth_coeffs: pd.DataFrame | None
     true_amp_offsets: pd.DataFrame | None
+    true_prism_response: pd.DataFrame | None
     sim_metadata: dict
 
 
@@ -171,6 +190,7 @@ class ModelState:
     shift: np.ndarray
     width: np.ndarray
     ice_coeff: np.ndarray
+    prism_response: np.ndarray
     zp: np.ndarray
     smooth_coeff: np.ndarray
     amp_offset: np.ndarray
@@ -183,6 +203,14 @@ class Linearization:
     d_sed_coeff: np.ndarray
     r_shift: np.ndarray
     r_width: np.ndarray
+    r_ice: np.ndarray
+
+
+@dataclass
+class PrismLinearization:
+    mag_model: np.ndarray
+    d_norm: np.ndarray
+    d_sed_coeff: np.ndarray
     r_ice: np.ndarray
 
 
@@ -335,10 +363,23 @@ def resolve_sed_basis_path(config: FitConfig, sim_metadata: dict, input_dir: Pat
 def load_data(config: FitConfig) -> DataBundle:
     input_dir = Path(config.input_dir)
     measurements = pd.read_csv(input_dir / "measurements.csv")
+    prism_path = input_dir / "prism_measurements.csv"
+    prism_measurements = pd.read_csv(prism_path) if prism_path.exists() else pd.DataFrame()
     if config.max_stars is not None:
         keep_star_ids = np.sort(measurements["star_id"].unique())[: config.max_stars]
+        calibrator_path = input_dir / "stellar_calibrators.csv"
+        if calibrator_path.exists():
+            calibrator_ids = pd.read_csv(calibrator_path, usecols=["star_id"])[
+                "star_id"
+            ].to_numpy(int)
+            keep_star_ids = np.unique(np.r_[keep_star_ids, calibrator_ids])
         measurements = measurements.loc[measurements["star_id"].isin(keep_star_ids)].copy()
         measurements.reset_index(drop=True, inplace=True)
+        if not prism_measurements.empty:
+            prism_measurements = prism_measurements.loc[
+                prism_measurements["star_id"].isin(keep_star_ids)
+            ].copy()
+            prism_measurements.reset_index(drop=True, inplace=True)
 
     wave, pass_data = load_long_grid_csv(
         input_dir / "nominal_passbands.csv", ["throughput"], "filter_id"
@@ -379,6 +420,32 @@ def load_data(config: FitConfig) -> DataBundle:
     else:
         amp_id = amp_id_from_x(measurements["x"].to_numpy(float), nx=config.nx, n_amp=config.n_amp)
 
+    star_lookup = {value: i for i, value in enumerate(star_ids)}
+    if not prism_measurements.empty:
+        missing_prism_stars = sorted(
+            set(prism_measurements["star_id"].to_numpy(int)).difference(star_lookup)
+        )
+        if missing_prism_stars:
+            raise ValueError("Prism table contains stars absent from imaging measurements")
+        prism_star_param_id = prism_measurements["star_id"].map(star_lookup).to_numpy(int)
+        prism_detector_param_id = (
+            prism_measurements["detector_id"].map(detector_lookup).to_numpy(int)
+        )
+        prism_exposure_id = prism_measurements["exposure_id"].to_numpy(int)
+        prism_pixel_id = prism_measurements["wavelength_pixel_id"].to_numpy(int)
+        if "amp_id" in prism_measurements.columns:
+            prism_amp_id = prism_measurements["amp_id"].to_numpy(int)
+        else:
+            prism_amp_id = amp_id_from_x(
+                prism_measurements["x"].to_numpy(float), nx=config.nx, n_amp=config.n_amp
+            )
+    else:
+        prism_star_param_id = np.asarray([], dtype=int)
+        prism_detector_param_id = np.asarray([], dtype=int)
+        prism_exposure_id = np.asarray([], dtype=int)
+        prism_pixel_id = np.asarray([], dtype=int)
+        prism_amp_id = np.asarray([], dtype=int)
+
     all_pass_filter_ids = pass_data["filter_ids"]
     pass_lookup = {value: i for i, value in enumerate(all_pass_filter_ids)}
     pass_indices = np.array([pass_lookup[value] for value in filter_ids], dtype=int)
@@ -402,6 +469,36 @@ def load_data(config: FitConfig) -> DataBundle:
     if reference_filter_id not in filter_lookup:
         raise ValueError("Reference filter is not present in the fitted measurement subset")
     reference_filter_index = filter_lookup[reference_filter_id]
+
+    nominal_prism_path = input_dir / "nominal_prism.csv"
+    if not prism_measurements.empty:
+        if not nominal_prism_path.exists():
+            raise FileNotFoundError("prism_measurements.csv requires nominal_prism.csv")
+        nominal_prism = pd.read_csv(nominal_prism_path).sort_values("wavelength_pixel_id")
+        expected_pixel = np.arange(len(nominal_prism), dtype=int)
+        if not np.array_equal(
+            nominal_prism["wavelength_pixel_id"].to_numpy(int), expected_pixel
+        ):
+            raise ValueError("nominal_prism.csv wavelength_pixel_id must be contiguous from zero")
+        prism_wave = nominal_prism["wavelength_um"].to_numpy(float)
+        prism_bin_width = nominal_prism["bin_width_um"].to_numpy(float)
+        prism_nominal_throughput = nominal_prism["nominal_throughput"].to_numpy(float)
+        if prism_pixel_id.min() < 0 or prism_pixel_id.max() >= prism_wave.size:
+            raise ValueError("Prism measurement wavelength_pixel_id is out of range")
+        prism_mean_log_flux = np.interp(
+            prism_wave, wave, sed_library.mean_log_flux
+        )
+        prism_components = np.vstack(
+            [np.interp(prism_wave, wave, component) for component in sed_library.components]
+        )
+        prism_ice_loglam_basis = make_loglam_basis(prism_wave, ice_loglam_nodes)
+    else:
+        prism_wave = np.asarray([], dtype=float)
+        prism_bin_width = np.asarray([], dtype=float)
+        prism_nominal_throughput = np.asarray([], dtype=float)
+        prism_mean_log_flux = np.asarray([], dtype=float)
+        prism_components = np.zeros((sed_library.n_components, 0))
+        prism_ice_loglam_basis = np.zeros((ice_loglam_nodes.size, 0))
 
     denom = trapz_integral(passbands, wave, axis=1)
     filter_eff = trapz_integral(passbands * wave[None, :], wave, axis=1) / denom
@@ -434,6 +531,20 @@ def load_data(config: FitConfig) -> DataBundle:
     free_star_index = np.full(star_ids.size, -1, dtype=int)
     free_star_index[free_star_indices] = np.arange(free_star_indices.size, dtype=int)
 
+    all_exposure_ids = np.unique(
+        np.r_[exposure_id, prism_exposure_id]
+    ).astype(int)
+    reference_exposure_ids = {0}
+    prism_reference = sim_metadata.get("prism_reference_exposure_id")
+    if prism_reference is not None and int(prism_reference) in all_exposure_ids:
+        reference_exposure_ids.add(int(prism_reference))
+    free_exposure_ids = np.asarray(
+        [exp_id for exp_id in all_exposure_ids if exp_id not in reference_exposure_ids],
+        dtype=int,
+    )
+    exposure_free_index = np.full(int(all_exposure_ids.max()) + 1, -1, dtype=int)
+    exposure_free_index[free_exposure_ids] = np.arange(free_exposure_ids.size, dtype=int)
+
     return DataBundle(
         measurements=measurements,
         wave=wave,
@@ -446,6 +557,20 @@ def load_data(config: FitConfig) -> DataBundle:
         detector_param_id=detector_param_id,
         star_param_id=star_param_id,
         amp_id=amp_id,
+        prism_measurements=prism_measurements,
+        prism_wave=prism_wave,
+        prism_bin_width=prism_bin_width,
+        prism_nominal_throughput=prism_nominal_throughput,
+        prism_star_param_id=prism_star_param_id,
+        prism_detector_param_id=prism_detector_param_id,
+        prism_exposure_id=prism_exposure_id,
+        prism_amp_id=prism_amp_id,
+        prism_pixel_id=prism_pixel_id,
+        prism_mean_log_flux=prism_mean_log_flux,
+        prism_components=prism_components,
+        prism_ice_loglam_basis=prism_ice_loglam_basis,
+        free_exposure_ids=free_exposure_ids,
+        exposure_free_index=exposure_free_index,
         star_is_calibrator=star_is_calibrator,
         free_star_indices=free_star_indices,
         free_star_index=free_star_index,
@@ -465,6 +590,7 @@ def load_data(config: FitConfig) -> DataBundle:
         true_exposure_zeropoints=read_optional("true_exposure_zeropoints.csv"),
         true_smooth_coeffs=read_optional("true_smooth_coeffs.csv"),
         true_amp_offsets=read_optional("true_amp_offsets.csv"),
+        true_prism_response=read_optional("true_prism_response.csv"),
         sim_metadata=sim_metadata,
     )
 
@@ -486,7 +612,7 @@ def make_initial_sed_grid(data: DataBundle) -> tuple[np.ndarray, np.ndarray]:
     return grid_coeff, shape_mag
 
 
-def fit_initial_stellar_seds(data: DataBundle) -> ModelState:
+def fit_initial_stellar_seds(data: DataBundle, config: FitConfig) -> ModelState:
     """Initial star-by-star BOSZ template search with nominal passbands and no ice.
 
     For each BOSZ template coefficient vector, the magnitude normalization is
@@ -528,11 +654,44 @@ def fit_initial_stellar_seds(data: DataBundle) -> ModelState:
     shift = np.zeros((data.filter_ids.size, data.detector_ids.size))
     width = np.zeros_like(shift)
     ice_coeff = np.zeros(data.ice_thickness_nodes.size * data.ice_loglam_nodes.size)
-    n_exp = int(data.exposure_id.max()) + 1
+    prism_response = np.zeros(data.prism_wave.size)
+    n_exp = data.exposure_free_index.size
     zp = np.zeros(n_exp)
     smooth_coeff = np.zeros(5)
     amp_offset = np.zeros((data.detector_ids.size, int(data.sim_metadata.get("n_amp", 32))))
-    return ModelState(mag_norm, sed_coeff, shift, width, ice_coeff, zp, smooth_coeff, amp_offset)
+    state = ModelState(
+        mag_norm,
+        sed_coeff,
+        shift,
+        width,
+        ice_coeff,
+        prism_response,
+        zp,
+        smooth_coeff,
+        amp_offset,
+    )
+    if not data.prism_measurements.empty and np.any(data.star_is_calibrator):
+        # Bootstrap the wavelength response from fixed standards in the prism
+        # reference exposure. The later joint iterations separate this initial
+        # response estimate from ice and focal-plane terms using all dithers.
+        prism_reference = data.sim_metadata.get("prism_reference_exposure_id")
+        standard = data.star_is_calibrator[data.prism_star_param_id]
+        if prism_reference is not None:
+            standard &= data.prism_exposure_id == int(prism_reference)
+        initial_prism = evaluate_prism_model_and_responses(
+            data, state, config, need_responses=False
+        )
+        bootstrap_residual = (
+            data.prism_measurements["mag_obs"].to_numpy(float)
+            - initial_prism.mag_model
+        )
+        for pixel_id in range(data.prism_wave.size):
+            selected = standard & (data.prism_pixel_id == pixel_id)
+            if np.any(selected):
+                state.prism_response[pixel_id] = np.median(
+                    bootstrap_residual[selected]
+                )
+    return state
 
 
 def evaluate_model_and_responses(
@@ -656,12 +815,118 @@ def evaluate_model_and_responses(
     return Linearization(mag_model, d_norm, d_sed_coeff, r_shift, r_width, r_ice)
 
 
+def evaluate_prism_model_and_responses(
+    data: DataBundle, state: ModelState, config: FitConfig, need_responses: bool = True
+) -> PrismLinearization:
+    """Evaluate prism-pixel magnitudes and their linearized response columns.
+
+    Each prism row is a finite wavelength-bin photon-counting measurement. The
+    midpoint quadrature used by the simulator is linear in physical flux. A
+    fitted additive magnitude response at every wavelength pixel represents the
+    prism's wavelength-dependent sensitivity calibration. Ice, stellar SED,
+    focal-plane, and amplifier terms are evaluated at that same detector pixel.
+    """
+    n_obs = len(data.prism_measurements)
+    n_component = data.sed_library.n_components
+    n_ice = data.ice_thickness_nodes.size * data.ice_loglam_nodes.size
+    if n_obs == 0:
+        return PrismLinearization(
+            np.asarray([], dtype=float),
+            np.asarray([], dtype=float),
+            np.zeros((0, n_component)),
+            np.zeros((0, n_ice)),
+        )
+
+    reference_passband = data.passbands[data.reference_filter_index]
+    shape = data.sed_library.sed_shape_from_coefficients(state.sed_coeff)
+    reference_weighted = shape * reference_passband[None, :]
+    reference_count = photon_count_integral(reference_weighted, data.wave, axis=1)
+    reference_ab_count = ab_reference_count(data.wave, reference_passband)
+    amplitude = (
+        reference_ab_count
+        * 10.0 ** (-0.4 * state.mag_norm)
+        / np.maximum(reference_count, 1e-300)
+    )
+
+    reference_component_mean = np.zeros((data.star_ids.size, n_component))
+    if need_responses:
+        for component_id in range(n_component):
+            reference_component_mean[:, component_id] = photon_count_integral(
+                reference_weighted * data.sed_library.components[component_id][None, :],
+                data.wave,
+                axis=1,
+            ) / np.maximum(reference_count, 1e-300)
+
+    star = data.prism_star_param_id
+    pixel = data.prism_pixel_id
+    detector = data.prism_detector_param_id
+    log_shape = data.prism_mean_log_flux[pixel]
+    log_shape += np.sum(
+        state.sed_coeff[star] * data.prism_components[:, pixel].T,
+        axis=1,
+    )
+    sed_flux_density = amplitude[star] * np.exp(log_shape)
+
+    thickness = data.prism_measurements["ice_thickness"].to_numpy(float)
+    lo, hi, w_lo, w_hi = thickness_brackets(thickness, data.ice_thickness_nodes)
+    loglam_basis = data.prism_ice_loglam_basis[:, pixel].T
+    n_loglam = data.ice_loglam_nodes.size
+    ice_grid = state.ice_coeff.reshape(data.ice_thickness_nodes.size, n_loglam)
+    ice_logt = w_lo * np.sum(ice_grid[lo] * loglam_basis, axis=1)
+    ice_logt += w_hi * np.sum(ice_grid[hi] * loglam_basis, axis=1)
+
+    count_flux = (
+        sed_flux_density
+        * data.prism_nominal_throughput[pixel]
+        * np.exp(ice_logt)
+        * data.prism_wave[pixel]
+        * data.prism_bin_width[pixel]
+    )
+    x_pix = data.prism_measurements["x"].to_numpy(float)
+    y_pix = data.prism_measurements["y"].to_numpy(float)
+    xn, yn = normalized_xy(x_pix, y_pix, nx=config.nx, ny=config.ny)
+    smooth = poly_basis(xn, yn) @ state.smooth_coeff
+    scalar = (
+        state.zp[data.prism_exposure_id]
+        + smooth
+        + state.amp_offset[detector, data.prism_amp_id]
+    )
+    mag_model = (
+        counts_to_instrumental_mag(count_flux)
+        + state.prism_response[pixel]
+        + scalar
+    )
+
+    d_sed_coeff = np.zeros((n_obs, n_component))
+    r_ice = np.zeros((n_obs, n_ice))
+    if need_responses:
+        d_sed_coeff = -MAG_FACTOR * (
+            data.prism_components[:, pixel].T - reference_component_mean[star]
+        )
+        for obs_index in range(n_obs):
+            for loglam_id in np.nonzero(loglam_basis[obs_index])[0]:
+                r_ice[obs_index, lo[obs_index] * n_loglam + loglam_id] += (
+                    -MAG_FACTOR * w_lo[obs_index] * loglam_basis[obs_index, loglam_id]
+                )
+                r_ice[obs_index, hi[obs_index] * n_loglam + loglam_id] += (
+                    -MAG_FACTOR * w_hi[obs_index] * loglam_basis[obs_index, loglam_id]
+                )
+
+    return PrismLinearization(
+        mag_model=mag_model,
+        d_norm=np.ones(n_obs),
+        d_sed_coeff=d_sed_coeff,
+        r_ice=r_ice,
+    )
+
+
 def parameter_slices(data: DataBundle) -> dict[str, slice]:
     n_free_star = data.free_star_indices.size
     n_sed = n_free_star * data.sed_library.n_components
     n_pass = data.filter_ids.size * data.detector_ids.size
     n_ice = data.ice_thickness_nodes.size * data.ice_loglam_nodes.size
-    n_zp = max(int(data.exposure_id.max()), 0)
+    n_prism = data.prism_wave.size
+    n_zp = data.free_exposure_ids.size
     n_smooth = 5
     n_amp = data.detector_ids.size * int(data.sim_metadata.get("n_amp", 32))
     start = 0
@@ -676,6 +941,8 @@ def parameter_slices(data: DataBundle) -> dict[str, slice]:
     start += n_pass
     slices["ice"] = slice(start, start + n_ice)
     start += n_ice
+    slices["prism_response"] = slice(start, start + n_prism)
+    start += n_prism
     slices["zp"] = slice(start, start + n_zp)
     start += n_zp
     slices["smooth"] = slice(start, start + n_smooth)
@@ -685,9 +952,13 @@ def parameter_slices(data: DataBundle) -> dict[str, slice]:
 
 
 def build_sparse_system(
-    data: DataBundle, state: ModelState, lin: Linearization, config: FitConfig
+    data: DataBundle,
+    state: ModelState,
+    lin: Linearization,
+    prism_lin: PrismLinearization,
+    config: FitConfig,
 ) -> tuple[coo_matrix, np.ndarray, dict[str, slice]]:
-    """Build weighted sparse system for one linearized update."""
+    """Build one weighted sparse update system from imaging and prism rows."""
     slices = parameter_slices(data)
     n_params = slices["amp"].stop
     n_components = data.sed_library.n_components
@@ -731,8 +1002,9 @@ def build_sparse_system(
                 )
         for basis_id in range(data.ice_thickness_nodes.size * data.ice_loglam_nodes.size):
             entries.append((slices["ice"].start + basis_id, lin.r_ice[obs_index, basis_id]))
-        if exp_id != 0:
-            entries.append((slices["zp"].start + exp_id - 1, 1.0))
+        exposure_param = data.exposure_free_index[exp_id]
+        if exposure_param >= 0:
+            entries.append((slices["zp"].start + exposure_param, 1.0))
         for smooth_id in range(5):
             entries.append((slices["smooth"].start + smooth_id, smooth_basis[obs_index, smooth_id]))
         amp_index = det * config.n_amp + data.amp_id[obs_index]
@@ -744,6 +1016,63 @@ def build_sparse_system(
             vals.append(value * weight)
         rhs.append(residual[obs_index] * weight)
         row += 1
+
+    if not data.prism_measurements.empty:
+        prism_mag = data.prism_measurements["mag_obs"].to_numpy(float)
+        prism_unc = data.prism_measurements["mag_unc"].to_numpy(float)
+        prism_residual = prism_mag - prism_lin.mag_model
+        prism_x = data.prism_measurements["x"].to_numpy(float)
+        prism_y = data.prism_measurements["y"].to_numpy(float)
+        prism_xn, prism_yn = normalized_xy(
+            prism_x, prism_y, nx=config.nx, ny=config.ny
+        )
+        prism_smooth_basis = poly_basis(prism_xn, prism_yn)
+        for obs_index in range(len(data.prism_measurements)):
+            weight = 1.0 / prism_unc[obs_index]
+            star = data.prism_star_param_id[obs_index]
+            detector = data.prism_detector_param_id[obs_index]
+            pixel = data.prism_pixel_id[obs_index]
+            free_star = data.free_star_index[star]
+            exp_id = data.prism_exposure_id[obs_index]
+            entries = [
+                (slices["prism_response"].start + pixel, 1.0),
+            ]
+            if free_star >= 0:
+                entries.append((slices["norm"].start + free_star, 1.0))
+                for component_id in range(n_components):
+                    coeff_index = free_star * n_components + component_id
+                    entries.append(
+                        (
+                            slices["sed_coeff"].start + coeff_index,
+                            prism_lin.d_sed_coeff[obs_index, component_id],
+                        )
+                    )
+            for basis_id in np.nonzero(prism_lin.r_ice[obs_index])[0]:
+                entries.append(
+                    (
+                        slices["ice"].start + basis_id,
+                        prism_lin.r_ice[obs_index, basis_id],
+                    )
+                )
+            exposure_param = data.exposure_free_index[exp_id]
+            if exposure_param >= 0:
+                entries.append((slices["zp"].start + exposure_param, 1.0))
+            for smooth_id in range(5):
+                entries.append(
+                    (
+                        slices["smooth"].start + smooth_id,
+                        prism_smooth_basis[obs_index, smooth_id],
+                    )
+                )
+            amp_index = detector * config.n_amp + data.prism_amp_id[obs_index]
+            entries.append((slices["amp"].start + amp_index, 1.0))
+
+            for col, value in entries:
+                rows.append(row)
+                cols.append(col)
+                vals.append(value * weight)
+            rhs.append(prism_residual[obs_index] * weight)
+            row += 1
 
     # Priors on current+update for calibration parameters choose a conservative
     # gauge in this degenerate chromatic problem.
@@ -766,6 +1095,29 @@ def build_sparse_system(
         cols.append(slices["ice"].start + basis_id)
         vals.append(1.0 / config.sigma_ice_prior)
         rhs.append(-current / config.sigma_ice_prior)
+        row += 1
+
+    # The spectrophotometric standards anchor the absolute prism response. A
+    # weak amplitude prior and second-difference smoothness prior stabilize
+    # wavelengths with missing or truncated spectra without erasing real shape.
+    for pixel_id, current in enumerate(state.prism_response):
+        rows.append(row)
+        cols.append(slices["prism_response"].start + pixel_id)
+        vals.append(1.0 / config.sigma_prism_response_prior)
+        rhs.append(-current / config.sigma_prism_response_prior)
+        row += 1
+
+    for pixel_id in range(1, state.prism_response.size - 1):
+        for offset, coefficient in ((-1, 1.0), (0, -2.0), (1, 1.0)):
+            rows.append(row)
+            cols.append(slices["prism_response"].start + pixel_id + offset)
+            vals.append(coefficient / config.sigma_prism_response_smoothness)
+        current_second_difference = (
+            state.prism_response[pixel_id - 1]
+            - 2.0 * state.prism_response[pixel_id]
+            + state.prism_response[pixel_id + 1]
+        )
+        rhs.append(-current_second_difference / config.sigma_prism_response_smoothness)
         row += 1
 
     # At exactly zero ice thickness, the ice perturbation is physically zero.
@@ -817,12 +1169,17 @@ def build_sparse_system(
 
 
 def apply_update(
-    state: ModelState, theta: np.ndarray, slices: dict[str, slice], data: DataBundle, config: FitConfig
+    state: ModelState,
+    theta: np.ndarray,
+    slices: dict[str, slice],
+    data: DataBundle,
+    config: FitConfig,
+    damping: float | None = None,
 ) -> None:
     n_components = data.sed_library.n_components
     n_filter = data.filter_ids.size
     n_det = data.detector_ids.size
-    damping = config.damping
+    damping = config.damping if damping is None else damping
 
     free = data.free_star_indices
     state.mag_norm[free] += damping * theta[slices["norm"]]
@@ -832,9 +1189,25 @@ def apply_update(
     state.shift += damping * theta[slices["shift"]].reshape(n_filter, n_det)
     state.width += damping * theta[slices["width"]].reshape(n_filter, n_det)
     state.ice_coeff += damping * theta[slices["ice"]]
-    state.zp[1:] += damping * theta[slices["zp"]]
+    state.prism_response += damping * theta[slices["prism_response"]]
+    state.zp[data.free_exposure_ids] += damping * theta[slices["zp"]]
     state.smooth_coeff += damping * theta[slices["smooth"]]
     state.amp_offset += damping * theta[slices["amp"]].reshape(n_det, config.n_amp)
+
+
+def copy_model_state(state: ModelState) -> ModelState:
+    """Deep-copy the numerical arrays in a model state for line-search trials."""
+    return ModelState(
+        mag_norm=state.mag_norm.copy(),
+        sed_coeff=state.sed_coeff.copy(),
+        shift=state.shift.copy(),
+        width=state.width.copy(),
+        ice_coeff=state.ice_coeff.copy(),
+        prism_response=state.prism_response.copy(),
+        zp=state.zp.copy(),
+        smooth_coeff=state.smooth_coeff.copy(),
+        amp_offset=state.amp_offset.copy(),
+    )
 
 
 def rms(values: np.ndarray) -> float:
@@ -923,6 +1296,51 @@ def evaluate_ab_zeropoint_observations(
     return zp_ab
 
 
+def evaluate_prism_scalar_terms(
+    data: DataBundle, state: ModelState, config: FitConfig
+) -> np.ndarray:
+    """Evaluate scalar exposure, smooth-field, and shared amp terms for prism rows."""
+    if data.prism_measurements.empty:
+        return np.asarray([], dtype=float)
+    x_pix = data.prism_measurements["x"].to_numpy(float)
+    y_pix = data.prism_measurements["y"].to_numpy(float)
+    xn, yn = normalized_xy(x_pix, y_pix, nx=config.nx, ny=config.ny)
+    smooth = poly_basis(xn, yn) @ state.smooth_coeff
+    return (
+        state.zp[data.prism_exposure_id]
+        + smooth
+        + state.amp_offset[data.prism_detector_param_id, data.prism_amp_id]
+    )
+
+
+def evaluate_prism_ab_zeropoints(
+    data: DataBundle, state: ModelState, config: FitConfig
+) -> np.ndarray:
+    """Return the fitted narrow-bin AB zeropoint for every prism measurement."""
+    if data.prism_measurements.empty:
+        return np.asarray([], dtype=float)
+    pixel = data.prism_pixel_id
+    thickness = data.prism_measurements["ice_thickness"].to_numpy(float)
+    lo, hi, w_lo, w_hi = thickness_brackets(thickness, data.ice_thickness_nodes)
+    n_loglam = data.ice_loglam_nodes.size
+    ice_grid = state.ice_coeff.reshape(data.ice_thickness_nodes.size, n_loglam)
+    loglam_basis = data.prism_ice_loglam_basis[:, pixel].T
+    ice_logt = w_lo * np.sum(ice_grid[lo] * loglam_basis, axis=1)
+    ice_logt += w_hi * np.sum(ice_grid[hi] * loglam_basis, axis=1)
+    ab_count = (
+        ab_f_lambda_per_micron(data.prism_wave[pixel])
+        * data.prism_nominal_throughput[pixel]
+        * np.exp(ice_logt)
+        * data.prism_wave[pixel]
+        * data.prism_bin_width[pixel]
+    )
+    return (
+        2.5 * np.log10(np.maximum(ab_count, 1e-300))
+        - state.prism_response[pixel]
+        - evaluate_prism_scalar_terms(data, state, config)
+    )
+
+
 def ice_surface_on_grid(data: DataBundle, ice_node_values: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Evaluate ice log-throughput surface on a dense thickness/wavelength grid."""
     thickness_grid = np.linspace(data.ice_thickness_nodes.min(), data.ice_thickness_nodes.max(), 80)
@@ -959,42 +1377,157 @@ def ice_surface_uncertainty_on_grid(
     return np.log10(data.wave), thickness_grid, sigma_surface
 
 
-def run_fit(data: DataBundle, config: FitConfig) -> tuple[ModelState, pd.DataFrame, np.ndarray]:
-    state = fit_initial_stellar_seds(data)
+def joint_weighted_rms(
+    data: DataBundle, imaging_residual: np.ndarray, prism_residual: np.ndarray
+) -> float:
+    """RMS of residual/sigma over both measurement types."""
+    imaging_sigma = data.measurements["mag_unc"].to_numpy(float)
+    weighted = [imaging_residual / imaging_sigma]
+    if prism_residual.size:
+        prism_sigma = data.prism_measurements["mag_unc"].to_numpy(float)
+        weighted.append(prism_residual / prism_sigma)
+    return rms(np.concatenate(weighted))
+
+
+def equilibrate_columns(A):
+    """Scale sparse columns to unit norm and return the inverse transformation.
+
+    The calibration matrix mixes parameters with very different natural units.
+    Solving ``(A D) z = b`` with unit-norm columns is algebraically equivalent
+    to the original system when ``theta = D z``, but is much better conditioned
+    for Krylov solvers.
+    """
+    column_norm = np.sqrt(np.asarray(A.power(2).sum(axis=0)).ravel())
+    parameter_scale = np.ones_like(column_norm)
+    nonzero = column_norm > 0.0
+    parameter_scale[nonzero] = 1.0 / column_norm[nonzero]
+    return A.multiply(parameter_scale).tocsr(), parameter_scale
+
+
+def run_fit(
+    data: DataBundle, config: FitConfig
+) -> tuple[ModelState, pd.DataFrame, np.ndarray, np.ndarray]:
+    state = fit_initial_stellar_seds(data, config)
     output_rows = []
 
     initial_lin = evaluate_model_and_responses(data, state, config, need_responses=False)
+    initial_prism_lin = evaluate_prism_model_and_responses(
+        data, state, config, need_responses=False
+    )
     obs_mag = data.measurements["mag_obs"].to_numpy(float)
+    prism_mag = (
+        data.prism_measurements["mag_obs"].to_numpy(float)
+        if not data.prism_measurements.empty
+        else np.asarray([], dtype=float)
+    )
     initial_resid = obs_mag - initial_lin.mag_model
-    output_rows.append({"iteration": 0, "rms_residual": rms(initial_resid), "lsmr_iters": 0})
-    print(f"Initial RMS residual: {rms(initial_resid):.6f} mag")
+    initial_prism_resid = prism_mag - initial_prism_lin.mag_model
+    initial_all_resid = np.r_[initial_resid, initial_prism_resid]
+    output_rows.append(
+        {
+            "iteration": 0,
+            "rms_residual": rms(initial_all_resid),
+            "imaging_rms_residual": rms(initial_resid),
+            "prism_rms_residual": (
+                rms(initial_prism_resid) if initial_prism_resid.size else np.nan
+            ),
+            "weighted_rms_residual": joint_weighted_rms(
+                data, initial_resid, initial_prism_resid
+            ),
+            "accepted_damping": 0.0,
+            "lsmr_iters": 0,
+        }
+    )
+    print(f"Initial combined RMS residual: {rms(initial_all_resid):.6f} mag")
 
     for iteration in range(1, config.n_iter + 1):
         lin = evaluate_model_and_responses(data, state, config, need_responses=True)
-        A, b, slices = build_sparse_system(data, state, lin, config)
-        result = lsmr(A, b, atol=1e-9, btol=1e-9, maxiter=2000, show=False)
-        theta = result[0]
-        apply_update(state, theta, slices, data, config)
+        prism_lin = evaluate_prism_model_and_responses(
+            data, state, config, need_responses=True
+        )
+        A, b, slices = build_sparse_system(data, state, lin, prism_lin, config)
+        A_scaled, parameter_scale = equilibrate_columns(A)
+        result = lsmr(
+            A_scaled, b, atol=1e-9, btol=1e-9, maxiter=2000, show=False
+        )
+        theta = parameter_scale * result[0]
+        current_resid = obs_mag - lin.mag_model
+        current_prism_resid = prism_mag - prism_lin.mag_model
+        current_objective = joint_weighted_rms(
+            data, current_resid, current_prism_resid
+        )
 
-        updated = evaluate_model_and_responses(data, state, config, need_responses=False)
-        resid = obs_mag - updated.mag_model
+        accepted_damping = 0.0
+        trial_damping = config.damping
+        resid = current_resid
+        prism_resid = current_prism_resid
+        while trial_damping >= config.min_damping:
+            candidate = copy_model_state(state)
+            apply_update(
+                candidate,
+                theta,
+                slices,
+                data,
+                config,
+                damping=trial_damping,
+            )
+            updated = evaluate_model_and_responses(
+                data, candidate, config, need_responses=False
+            )
+            updated_prism = evaluate_prism_model_and_responses(
+                data, candidate, config, need_responses=False
+            )
+            trial_resid = obs_mag - updated.mag_model
+            trial_prism_resid = prism_mag - updated_prism.mag_model
+            trial_objective = joint_weighted_rms(
+                data, trial_resid, trial_prism_resid
+            )
+            if np.isfinite(trial_objective) and trial_objective < current_objective:
+                state = candidate
+                resid = trial_resid
+                prism_resid = trial_prism_resid
+                accepted_damping = trial_damping
+                break
+            trial_damping *= 0.5
+
+        if accepted_damping == 0.0:
+            print(
+                f"Iteration {iteration}: no tested damping improved the joint "
+                "weighted objective; update rejected."
+            )
+        all_resid = np.r_[resid, prism_resid]
         output_rows.append(
             {
                 "iteration": iteration,
-                "rms_residual": rms(resid),
+                "rms_residual": rms(all_resid),
+                "imaging_rms_residual": rms(resid),
+                "prism_rms_residual": rms(prism_resid) if prism_resid.size else np.nan,
                 "lsmr_iters": result[2],
                 "lsmr_stop_code": result[1],
                 "update_norm": float(np.linalg.norm(theta)),
+                "accepted_damping": accepted_damping,
+                "weighted_rms_residual": joint_weighted_rms(
+                    data, resid, prism_resid
+                ),
             }
         )
+        prism_message = (
+            f"prism = {rms(prism_resid):.6f} mag, " if prism_resid.size else ""
+        )
         print(
-            f"Iteration {iteration}: RMS residual = {rms(resid):.6f} mag, "
+            f"Iteration {iteration}: combined RMS = {rms(all_resid):.6f} mag, "
+            f"imaging = {rms(resid):.6f} mag, "
+            f"{prism_message}damping = {accepted_damping:.5f}, "
             f"LSMR iters = {result[2]}"
         )
 
     final_lin = evaluate_model_and_responses(data, state, config, need_responses=False)
+    final_prism_lin = evaluate_prism_model_and_responses(
+        data, state, config, need_responses=False
+    )
     final_resid = obs_mag - final_lin.mag_model
-    return state, pd.DataFrame(output_rows), final_resid
+    final_prism_resid = prism_mag - final_prism_lin.mag_model
+    return state, pd.DataFrame(output_rows), final_resid, final_prism_resid
 
 
 def estimate_parameter_uncertainties(
@@ -1011,9 +1544,13 @@ def estimate_parameter_uncertainties(
     """
     print("Estimating formal parameter uncertainties with LSQR...")
     lin = evaluate_model_and_responses(data, state, config, need_responses=True)
-    A, b, slices = build_sparse_system(data, state, lin, config)
+    prism_lin = evaluate_prism_model_and_responses(
+        data, state, config, need_responses=True
+    )
+    A, b, slices = build_sparse_system(data, state, lin, prism_lin, config)
+    A_scaled, parameter_scale = equilibrate_columns(A)
     result = lsqr(
-        A,
+        A_scaled,
         b,
         atol=1e-9,
         btol=1e-9,
@@ -1021,7 +1558,7 @@ def estimate_parameter_uncertainties(
         show=False,
         calc_var=True,
     )
-    var = np.maximum(result[-1], 0.0)
+    var = np.maximum(result[-1], 0.0) * parameter_scale**2
     dof = max(A.shape[0] - A.shape[1], 1)
     reduced_chi2 = (result[3] ** 2) / dof
     sigma = np.sqrt(var * max(reduced_chi2, 1e-12))
@@ -1070,6 +1607,7 @@ def save_outputs(
     state: ModelState,
     summary: pd.DataFrame,
     final_resid: np.ndarray,
+    final_prism_resid: np.ndarray,
     config: FitConfig,
     param_sigma: np.ndarray | None = None,
     slices: dict[str, slice] | None = None,
@@ -1119,10 +1657,25 @@ def save_outputs(
     pd.DataFrame(pass_rows).to_csv(output_dir / "fit_passband_params.csv", index=False)
 
     zp_rows = []
+    prism_reference = data.sim_metadata.get("prism_reference_exposure_id")
     for exp_id, zp_value in enumerate(state.zp):
-        row = {"exposure_id": exp_id, "zp_mag": zp_value}
+        exposure_param = data.exposure_free_index[exp_id]
+        row = {
+            "exposure_id": exp_id,
+            "measurement_type": (
+                "prism"
+                if prism_reference is not None and exp_id >= int(prism_reference)
+                else "imaging"
+            ),
+            "is_reference": exposure_param < 0,
+            "zp_mag": zp_value,
+        }
         if param_sigma is not None and slices is not None:
-            row["zp_mag_sigma"] = 0.0 if exp_id == 0 else param_sigma[slices["zp"].start + exp_id - 1]
+            row["zp_mag_sigma"] = (
+                0.0
+                if exposure_param < 0
+                else param_sigma[slices["zp"].start + exposure_param]
+            )
         zp_rows.append(row)
     pd.DataFrame(zp_rows).to_csv(output_dir / "fit_exposure_zeropoints.csv", index=False)
 
@@ -1166,6 +1719,19 @@ def save_outputs(
                 ice_rows[-1]["ice_logt_node_sigma"] = param_sigma[slices["ice"].start + index]
     pd.DataFrame(ice_rows).to_csv(output_dir / "fit_ice_spline_params.csv", index=False)
 
+    prism_response_rows = pd.DataFrame(
+        {
+            "wavelength_pixel_id": np.arange(data.prism_wave.size, dtype=int),
+            "wavelength_um": data.prism_wave,
+            "prism_response_mag": state.prism_response,
+        }
+    )
+    if param_sigma is not None and slices is not None and data.prism_wave.size:
+        prism_response_rows["prism_response_mag_sigma"] = param_sigma[
+            slices["prism_response"]
+        ]
+    prism_response_rows.to_csv(output_dir / "fit_prism_response.csv", index=False)
+
     summary.to_csv(output_dir / "fit_iteration_summary.csv", index=False)
 
     residuals = data.measurements.copy()
@@ -1189,6 +1755,39 @@ def save_outputs(
         ]
     ].to_csv(output_dir / "fit_ab_zeropoints.csv", index=False)
 
+    if not data.prism_measurements.empty:
+        prism_residuals = data.prism_measurements.copy()
+        prism_residuals["mag_residual"] = final_prism_resid
+        prism_residuals["fit_prism_response_mag"] = state.prism_response[
+            data.prism_pixel_id
+        ]
+        prism_residuals["fit_scalar_delta_mag"] = evaluate_prism_scalar_terms(
+            data, state, config
+        )
+        prism_residuals["fit_ab_zeropoint_mag"] = evaluate_prism_ab_zeropoints(
+            data, state, config
+        )
+        prism_residuals["calibrated_ab_mag"] = (
+            prism_residuals["mag_obs"] + prism_residuals["fit_ab_zeropoint_mag"]
+        )
+        prism_residuals.to_csv(output_dir / "fit_prism_residuals.csv", index=False)
+        prism_residuals[
+            [
+                "prism_obs_id",
+                "spectrum_id",
+                "exposure_id",
+                "star_id",
+                "detector_id",
+                "amp_id",
+                "wavelength_pixel_id",
+                "wavelength_um",
+                "x",
+                "y",
+                "ice_thickness",
+                "fit_ab_zeropoint_mag",
+            ]
+        ].to_csv(output_dir / "fit_prism_ab_zeropoints.csv", index=False)
+
     with open(output_dir / "fit_config.json", "w", encoding="utf-8") as handle:
         payload = dict(config.__dict__)
         if uncertainty_info is not None:
@@ -1206,28 +1805,29 @@ def print_diagnostics(
     state: ModelState,
     summary: pd.DataFrame,
     final_resid: np.ndarray,
+    final_prism_resid: np.ndarray,
     param_sigma: np.ndarray | None = None,
     slices: dict[str, slice] | None = None,
 ) -> None:
     true_shift, true_width, true_ice = make_truth_arrays(data)
 
-    print("\nRoman passband / ice sparse fit diagnostics")
-    print("-------------------------------------------")
-    print(f"Number of observations: {len(data.measurements)}")
+    print("\nRoman imaging / prism sparse fit diagnostics")
+    print("---------------------------------------------")
+    print(f"Number of imaging observations: {len(data.measurements)}")
+    print(f"Number of prism wavelength pixels: {len(data.prism_measurements)}")
     print(f"Number of stars: {data.star_ids.size}")
     print(f"Number of fixed absolute calibrator stars: {int(data.star_is_calibrator.sum())}")
     print(f"Number of fitted stars: {data.free_star_indices.size}")
     print(f"Number of filters: {data.filter_ids.size}")
     print(f"Number of detectors: {data.detector_ids.size}")
     print(f"Number of BOSZ EMPCA SED components: {data.sed_library.n_components}")
-    n_params = (1 + data.sed_library.n_components) * data.free_star_indices.size
-    n_params += 2 * data.filter_ids.size * data.detector_ids.size
-    n_params += data.ice_thickness_nodes.size * data.ice_loglam_nodes.size
+    n_params = parameter_slices(data)["amp"].stop
     n_amp = int(data.sim_metadata.get("n_amp", 32))
-    n_params += max(int(data.exposure_id.max()), 0) + 5 + data.detector_ids.size * n_amp
     print(f"Number of fitted linearized parameters per iteration: {n_params}")
-    print(f"Initial RMS residual: {summary.iloc[0]['rms_residual']:.6f} mag")
-    print(f"Final RMS residual: {rms(final_resid):.6f} mag")
+    print(f"Initial combined RMS residual: {summary.iloc[0]['rms_residual']:.6f} mag")
+    print(f"Final imaging RMS residual: {rms(final_resid):.6f} mag")
+    if final_prism_resid.size:
+        print(f"Final prism RMS residual: {rms(final_prism_resid):.6f} mag")
 
     residual_frame = data.measurements[["filter_id", "detector_id"]].copy()
     residual_frame["residual"] = final_resid
@@ -1247,6 +1847,14 @@ def print_diagnostics(
         _, _, true_surface = ice_surface_on_grid(data, true_ice)
         _, _, fit_surface = ice_surface_on_grid(data, state.ice_coeff)
         print(f"Ice log-throughput surface RMS error: {rms(fit_surface - true_surface):.6f}")
+    if data.true_prism_response is not None and state.prism_response.size:
+        truth = data.true_prism_response.sort_values("wavelength_pixel_id")
+        true_response = truth["prism_response_mag"].to_numpy(float)
+        if true_response.size == state.prism_response.size:
+            print(
+                "Prism wavelength-response RMS error: "
+                f"{rms(state.prism_response - true_response):.6f} mag"
+            )
     if data.true_exposure_zeropoints is not None:
         true_zp = np.zeros_like(state.zp)
         for _, row in data.true_exposure_zeropoints.iterrows():
@@ -1277,6 +1885,11 @@ def print_diagnostics(
     if param_sigma is not None and slices is not None:
         ice_sigma = param_sigma[slices["ice"]]
         print(f"Median formal ice-node uncertainty: {np.median(ice_sigma):.6f}")
+        if state.prism_response.size:
+            print(
+                "Median formal prism-response uncertainty: "
+                f"{np.median(param_sigma[slices['prism_response']]):.6f} mag"
+            )
     print(
         "Note: stellar EMPCA coefficients, passband color terms, and ice surface "
         "modes remain partially degenerate; recovery depends on priors and "
@@ -1289,6 +1902,7 @@ def make_plots(
     state: ModelState,
     summary: pd.DataFrame,
     final_resid: np.ndarray,
+    final_prism_resid: np.ndarray,
     config: FitConfig,
     param_sigma: np.ndarray | None = None,
     slices: dict[str, slice] | None = None,
@@ -1336,10 +1950,26 @@ def make_plots(
         plt.close()
 
     plt.figure(figsize=(6.5, 4.5))
-    plt.plot(summary["iteration"], summary["rms_residual"], marker="o")
+    plt.plot(
+        summary["iteration"], summary["rms_residual"], marker="o", label="combined"
+    )
+    plt.plot(
+        summary["iteration"],
+        summary["imaging_rms_residual"],
+        marker="s",
+        label="imaging",
+    )
+    if summary["prism_rms_residual"].notna().any():
+        plt.plot(
+            summary["iteration"],
+            summary["prism_rms_residual"],
+            marker="^",
+            label="prism",
+        )
     plt.xlabel("Iteration")
     plt.ylabel("RMS residual [mag]")
     plt.title("Residuals by iteration")
+    plt.legend()
     plt.tight_layout()
     plt.savefig(output_dir / "residuals_by_iteration.png", dpi=160)
     plt.close()
@@ -1363,6 +1993,150 @@ def make_plots(
             "Passband width recovery",
             "passband_width_true_vs_fit.png",
         )
+
+    if data.true_prism_response is not None and state.prism_response.size:
+        truth = data.true_prism_response.sort_values("wavelength_pixel_id")
+        true_response = truth["prism_response_mag"].to_numpy(float)
+        response_sigma = (
+            param_sigma[slices["prism_response"]]
+            if param_sigma is not None and slices is not None
+            else None
+        )
+        response_residual = state.prism_response - true_response
+        fig, axes = plt.subplots(
+            2,
+            1,
+            figsize=(9, 7),
+            sharex=True,
+            gridspec_kw={"height_ratios": [2.0, 1.0]},
+        )
+        axes[0].plot(data.prism_wave, true_response, label="true", linewidth=1.8)
+        axes[0].plot(data.prism_wave, state.prism_response, label="fit", linewidth=1.3)
+        if response_sigma is not None:
+            axes[0].fill_between(
+                data.prism_wave,
+                state.prism_response - response_sigma,
+                state.prism_response + response_sigma,
+                alpha=0.22,
+                label="formal 1-sigma",
+            )
+        axes[0].set_ylabel("Prism response [mag]")
+        axes[0].set_title("Prism wavelength calibration recovery")
+        axes[0].legend()
+        axes[1].plot(data.prism_wave, response_residual, color="tab:red")
+        axes[1].axhline(0.0, color="0.3", linewidth=1)
+        axes[1].set_xlabel("Wavelength [um]")
+        axes[1].set_ylabel("Fit - true [mag]")
+        fig.tight_layout()
+        fig.savefig(output_dir / "prism_response_true_vs_fit.png", dpi=160)
+        plt.close(fig)
+
+    if final_prism_resid.size:
+        prism_frame = pd.DataFrame(
+            {
+                "wavelength_um": data.prism_measurements["wavelength_um"].to_numpy(float),
+                "pixel_id": data.prism_pixel_id,
+                "residual": final_prism_resid,
+            }
+        )
+        grouped = prism_frame.groupby("pixel_id")
+        wave_by_pixel = grouped["wavelength_um"].median()
+        median_by_pixel = grouped["residual"].median()
+        rms_by_pixel = grouped["residual"].apply(lambda values: rms(values.to_numpy()))
+        fig, axes = plt.subplots(2, 1, figsize=(9, 7), sharex=True)
+        axes[0].scatter(
+            prism_frame["wavelength_um"],
+            prism_frame["residual"],
+            s=2,
+            alpha=0.08,
+        )
+        axes[0].plot(wave_by_pixel, median_by_pixel, color="black", linewidth=1.2)
+        axes[0].axhline(0.0, color="0.3", linewidth=1)
+        axes[0].set_ylabel("Residual [mag]")
+        axes[0].set_title("Prism residual versus wavelength")
+        axes[1].plot(wave_by_pixel, rms_by_pixel, color="tab:orange")
+        axes[1].set_xlabel("Wavelength [um]")
+        axes[1].set_ylabel("RMS residual [mag]")
+        fig.tight_layout()
+        fig.savefig(output_dir / "prism_residual_vs_wavelength.png", dpi=160)
+        plt.close(fig)
+
+        plt.figure(figsize=(8, 4.8))
+        standard = data.prism_measurements[
+            "is_spectrophotometric_standard"
+        ].to_numpy(bool)
+        bins = np.linspace(
+            np.percentile(final_prism_resid, 0.2),
+            np.percentile(final_prism_resid, 99.8),
+            55,
+        )
+        plt.hist(
+            final_prism_resid[~standard], bins=bins, histtype="step", label="field stars"
+        )
+        if np.any(standard):
+            plt.hist(
+                final_prism_resid[standard],
+                bins=bins,
+                histtype="step",
+                linewidth=1.6,
+                label="spectrophotometric standards",
+            )
+        plt.axvline(0.0, color="0.3", linewidth=1)
+        plt.xlabel("Prism residual [mag]")
+        plt.ylabel("Count")
+        plt.title("Prism residual distribution")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(output_dir / "prism_residual_histogram.png", dpi=160)
+        plt.close()
+
+        if np.any(standard):
+            prism_ab_zp = evaluate_prism_ab_zeropoints(data, state, config)
+            calibrated_ab = (
+                data.prism_measurements["mag_obs"].to_numpy(float) + prism_ab_zp
+            )
+            standard_ids, standard_counts = np.unique(
+                data.prism_measurements.loc[standard, "star_id"].to_numpy(int),
+                return_counts=True,
+            )
+            selected_star = standard_ids[np.argmax(standard_counts)]
+            selected = standard & (
+                data.prism_measurements["star_id"].to_numpy(int) == selected_star
+            )
+            standard_frame = pd.DataFrame(
+                {
+                    "pixel_id": data.prism_pixel_id[selected],
+                    "wavelength_um": data.prism_measurements.loc[
+                        selected, "wavelength_um"
+                    ].to_numpy(float),
+                    "fit_ab": calibrated_ab[selected],
+                    "true_ab": data.prism_measurements.loc[
+                        selected, "true_ab_mag"
+                    ].to_numpy(float),
+                }
+            )
+            med = standard_frame.groupby("pixel_id").median(numeric_only=True)
+            standard_residual = med["fit_ab"] - med["true_ab"]
+            fig, axes = plt.subplots(
+                2,
+                1,
+                figsize=(9, 7),
+                sharex=True,
+                gridspec_kw={"height_ratios": [2.0, 1.0]},
+            )
+            axes[0].plot(med["wavelength_um"], med["true_ab"], label="known standard")
+            axes[0].plot(med["wavelength_um"], med["fit_ab"], label="calibrated prism")
+            axes[0].invert_yaxis()
+            axes[0].set_ylabel("Narrow-bin AB magnitude")
+            axes[0].set_title(f"Spectrophotometric standard star {selected_star}")
+            axes[0].legend()
+            axes[1].plot(med["wavelength_um"], standard_residual, color="tab:red")
+            axes[1].axhline(0.0, color="0.3", linewidth=1)
+            axes[1].set_xlabel("Wavelength [um]")
+            axes[1].set_ylabel("Fit - known [mag]")
+            fig.tight_layout()
+            fig.savefig(output_dir / "prism_standard_absolute_calibration.png", dpi=160)
+            plt.close(fig)
 
     amps = np.arange(config.n_amp)
     dets = range(data.detector_ids.size)
@@ -1573,25 +2347,43 @@ def make_plots(
     plt.close()
 
     amp_median = np.full((data.detector_ids.size, config.n_amp), np.nan)
+    prism_amp_median = np.full_like(amp_median, np.nan)
     for det_i in range(data.detector_ids.size):
         for amp_id in range(config.n_amp):
             mask = (data.detector_param_id == det_i) & (data.amp_id == amp_id)
             if np.any(mask):
                 amp_median[det_i, amp_id] = np.median(final_resid[mask])
+            if final_prism_resid.size:
+                prism_mask = (
+                    (data.prism_detector_param_id == det_i)
+                    & (data.prism_amp_id == amp_id)
+                )
+                if np.any(prism_mask):
+                    prism_amp_median[det_i, amp_id] = np.median(
+                        final_prism_resid[prism_mask]
+                    )
     plt.figure(figsize=(10, 5))
     for det_i in range(data.detector_ids.size):
         plt.plot(
             amps,
             amp_median[det_i],
             marker="o",
-            label=f"det {int(data.detector_ids[det_i]):02d}",
+            label=f"imaging det {int(data.detector_ids[det_i]):02d}",
         )
+        if final_prism_resid.size:
+            plt.plot(
+                amps,
+                prism_amp_median[det_i],
+                marker="s",
+                linestyle="--",
+                label=f"prism det {int(data.detector_ids[det_i]):02d}",
+            )
     plt.axhline(0.0, color="0.2", linewidth=1)
     plt.xlabel("Amplifier ID")
     plt.ylabel("Median residual [mag]")
     plt.title("Median residual per amplifier")
-    if data.detector_ids.size > 1:
-        plt.legend(ncol=3, fontsize=8)
+    if data.detector_ids.size > 1 or final_prism_resid.size:
+        plt.legend(ncol=2, fontsize=8)
     plt.tight_layout()
     plt.savefig(output_dir / "residual_vs_amp.png", dpi=160)
     plt.close()
@@ -1711,20 +2503,38 @@ def main() -> None:
     warnings.filterwarnings("ignore", category=RuntimeWarning)
     config = parse_args()
     data = load_data(config)
-    state, summary, final_resid = run_fit(data, config)
+    state, summary, final_resid, final_prism_resid = run_fit(data, config)
     param_sigma, slices, uncertainty_info = estimate_parameter_uncertainties(data, state, config)
     save_outputs(
         data,
         state,
         summary,
         final_resid,
+        final_prism_resid,
         config,
         param_sigma=param_sigma,
         slices=slices,
         uncertainty_info=uncertainty_info,
     )
-    print_diagnostics(data, state, summary, final_resid, param_sigma=param_sigma, slices=slices)
-    make_plots(data, state, summary, final_resid, config, param_sigma=param_sigma, slices=slices)
+    print_diagnostics(
+        data,
+        state,
+        summary,
+        final_resid,
+        final_prism_resid,
+        param_sigma=param_sigma,
+        slices=slices,
+    )
+    make_plots(
+        data,
+        state,
+        summary,
+        final_resid,
+        final_prism_resid,
+        config,
+        param_sigma=param_sigma,
+        slices=slices,
+    )
     print(f"Saved fit outputs to {Path(config.output_dir).resolve()}")
 
 
