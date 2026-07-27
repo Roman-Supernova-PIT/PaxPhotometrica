@@ -2304,10 +2304,38 @@ def print_diagnostics(
             truth = data.true_star_params.set_index("star_id").loc[data.star_ids]
             true_coeff = truth[coeff_cols].to_numpy(float)
             free = data.free_star_indices
+            coeff_error = state.sed_coeff - true_coeff
+            observed_filter_count = np.zeros(data.star_ids.size, dtype=int)
+            for star_index in range(data.star_ids.size):
+                observed_filter_count[star_index] = np.unique(
+                    data.filter_param_id[data.star_param_id == star_index]
+                ).size
             print(
-                "Field-star EMPCA coefficient RMS error: "
-                f"{rms(state.sed_coeff[free] - true_coeff[free]):.6f}"
+                "Field-star EMPCA coefficient RMS error, all fitted stars: "
+                f"{rms(coeff_error[free]):.6f}"
             )
+            for minimum_filter in sorted({4, data.filter_ids.size}):
+                selected = free[
+                    observed_filter_count[free] >= minimum_filter
+                ]
+                if selected.size:
+                    label = (
+                        f">={minimum_filter} observed filters"
+                        if minimum_filter < data.filter_ids.size
+                        else f"all {data.filter_ids.size} observed filters"
+                    )
+                    print(
+                        f"Field-star EMPCA coefficient RMS error, {label}: "
+                        f"{rms(coeff_error[selected]):.6f}"
+                    )
+            one_filter_count = int(
+                np.count_nonzero(observed_filter_count[free] == 1)
+            )
+            if one_filter_count:
+                print(
+                    f"Note: {one_filter_count} fitted stars have only one "
+                    "observed filter, so their EMPCA colors are not identifiable."
+                )
     if param_sigma is not None and slices is not None:
         ice_sigma = param_sigma[slices["ice"]]
         print(f"Median formal ice-node uncertainty: {np.median(ice_sigma):.6f}")

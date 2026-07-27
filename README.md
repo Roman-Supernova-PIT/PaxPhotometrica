@@ -924,52 +924,58 @@ log-throughput perturbation.
 
 ### Default Verification
 
-A default run currently produces `45,532` imaging observations and `14,125`
-prism wavelength-pixel measurements from `75` extracted spectra. The prism
-targets are 1% of the 2,000-star sample, including all `5` physical
-spectrophotometric standards. The fit solves `11,290` linearized update
-parameters per iteration.
+A default run currently produces `26,421` imaging observations and `8,851`
+prism wavelength-pixel measurements from `46` extracted spectra. The parent
+catalog contains 2,000 stars over the union of all exposure footprints; 1,887
+receive at least one retained imaging measurement. The prism target list is 1%
+of the parent catalog and includes all `5` physical spectrophotometric
+standards. The fit solves `10,725` linearized update parameters per iteration.
 The verified iteration summary is:
 
 ```text
 iteration  combined RMS  imaging RMS  prism RMS  accepted damping
-0          0.031690      0.028457     0.040387   0.0000
-1          0.029390      0.026048     0.038223   0.0625
-2          0.026541      0.023655     0.034226   0.1250
-3          0.024325      0.023250     0.027507   0.2500
-4          0.020875      0.021466     0.018840   0.5000
-5          0.013065      0.012046     0.015913   0.5000
-6          0.009751      0.007355     0.015074   0.5000
-7          0.008709      0.005569     0.014846   0.5000
-8          0.008422      0.005014     0.014783   0.5000
-9          0.008342      0.004855     0.014763   0.5000
-10         0.008316      0.004803     0.014756   0.5000
-11         0.008304      0.004779     0.014752   0.5000
-12         0.008297      0.004765     0.014750   0.5000
-13         0.008290      0.004749     0.014748   0.5000
-14         0.008277      0.004722     0.014747   0.5000
-15         0.008261      0.004686     0.014746   0.5000
+0          0.242914      0.016453     0.484087   0.0000
+1          0.121983      0.009525     0.242955   0.5000
+2          0.061536      0.006517     0.122324   0.5000
+3          0.031647      0.005059     0.062569   0.5000
+4          0.017427      0.004603     0.033868   0.5000
+5          0.011350      0.004476     0.021298   0.5000
+6          0.009214      0.004435     0.016722   0.5000
+7          0.008589      0.004417     0.015355   0.5000
+8          0.008419      0.004405     0.014985   0.5000
+9          0.008370      0.004395     0.014884   0.5000
+10         0.008354      0.004388     0.014853   0.5000
+11         0.008345      0.004381     0.014841   0.5000
+12         0.008339      0.004374     0.014833   0.5000
+13         0.008335      0.004369     0.014828   0.5000
+14         0.008331      0.004363     0.014823   0.5000
+15         0.008327      0.004358     0.014819   0.5000
 ```
 
 Final default diagnostics:
 
 ```text
-Passband shift RMS error: 0.008504 um
-Passband width RMS error: 0.049688
-Ice log-throughput surface RMS error: 0.025392
-Prism spectrophotometric-response RMS error: 0.002183 mag
-Exposure ZP RMS error: 0.121064 mag
-Imaging smooth-coefficient RMS error: 0.002046 mag
-Prism smooth-coefficient RMS error: 0.003047 mag
-Amp offset RMS error, detector means removed: 0.001177 mag
-Field-star EMPCA coefficient RMS error: 0.156358
-Median formal ice-node uncertainty: 0.003742
-Median formal prism-response uncertainty: 0.000933 mag
+Passband shift RMS error: 0.002252 um
+Passband width RMS error: 0.016363
+Ice log-throughput surface RMS error: 0.011202
+Prism spectrophotometric-response RMS error: 0.002956 mag
+Exposure ZP RMS error: 0.016819 mag
+Imaging smooth-coefficient RMS error: 0.002323 mag
+Prism smooth-coefficient RMS error: 0.002991 mag
+Amp offset RMS error, detector means removed: 0.002227 mag
+Field-star EMPCA coefficient RMS error, all fitted stars: 6.613374
+Field-star EMPCA coefficient RMS error, >=4 observed filters: 0.087917
+Field-star EMPCA coefficient RMS error, all 6 observed filters: 0.061179
+Median formal ice-node uncertainty: 0.005718
+Median formal prism-response uncertainty: 0.000890 mag
 ```
 
 The imaging and prism residuals reach their injected noise scales, but the
-larger exposure-ZP and passband-parameter truth errors make the remaining
-chromatic gauge freedom visible: several combinations of exposure offsets,
-stellar EMPCA colors, passband modes, and ice structure predict nearly the same
-data. This is deliberate prototype behavior rather than a claim of unique
-physical parameter recovery.
+sky-union catalog intentionally contains boundary stars with incomplete filter
+coverage. In particular, 238 fitted stars appear in only one filter, so their
+EMPCA colors are not identifiable and dominate the all-star coefficient RMS.
+The restricted coefficient diagnostics show the recovery for stars with actual
+color leverage. More generally, several combinations of exposure offsets,
+stellar EMPCA colors, passband modes, and ice structure still predict nearly
+the same data. This is deliberate prototype behavior rather than a claim of
+unique physical parameter recovery.
