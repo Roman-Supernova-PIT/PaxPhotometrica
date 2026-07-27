@@ -13,6 +13,10 @@ log-throughput surface. Sparse prism spectra add one sensitivity parameter per
 wavelength pixel. Imaging smooth fields vary by filter and detector, prism
 smooth fields vary by wavelength pixel and detector, and both data types share
 one set of detector/amplifier gains.
+
+Field-star SEDs use fitted BOSZ EMPCA coordinates and normalizations.
+Spectrophotometric standards instead enter as fixed physical
+``f_lambda``-versus-wavelength files and have no stellar fit parameters.
 """
 
 from __future__ import annotations
@@ -43,6 +47,7 @@ from tqdm import tqdm
 MAG_FACTOR = 2.5 / np.log(10.0)
 SPEED_OF_LIGHT_CM_S = 2.99792458e10
 MICRON_TO_CM = 1.0e-4
+ANGSTROM_PER_MICRON = 1.0e4
 AB_FNU_CGS = 3631.0e-23  # erg / s / cm^2 / Hz
 
 
@@ -166,8 +171,11 @@ class DataBundle:
     free_exposure_ids: np.ndarray
     exposure_free_index: np.ndarray
     star_is_calibrator: np.ndarray
+    star_standard_spectrum_index: np.ndarray
     free_star_indices: np.ndarray
     free_star_index: np.ndarray
+    standard_sed_flux: np.ndarray
+    standard_prism_flux: np.ndarray
     passbands: np.ndarray
     reference_filter_index: int
     phi_shift: np.ndarray
@@ -177,7 +185,7 @@ class DataBundle:
     ice_thickness_nodes: np.ndarray
     ice_loglam_basis: np.ndarray
     filter_effective_wavelength: np.ndarray
-    absolute_calibrators: pd.DataFrame | None
+    standard_manifest: pd.DataFrame
     true_star_params: pd.DataFrame | None
     true_passband_params: pd.DataFrame | None
     true_ice_spline_params: pd.DataFrame | None
@@ -366,19 +374,161 @@ def resolve_sed_basis_path(config: FitConfig, sim_metadata: dict, input_dir: Pat
     )
 
 
+def load_spectrophotometric_standards(
+    input_dir: Path,
+    manifest: pd.DataFrame,
+    star_ids: np.ndarray,
+    wave: np.ndarray,
+    prism_wave: np.ndarray,
+) -> tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray]:
+    """Load fixed physical f_lambda spectra referenced by a star manifest.
+
+    Each spectrum is sampled from a two-column CSV with ``wavelength_um`` and
+    ``f_lambda_cgs_per_angstrom``. The fitter converts the physical flux
+    densities to per micron, interpolates them onto its imaging and fixed prism
+    grids, and never converts the standards to EMPCA coefficients or fitted
+    magnitude normalizations.
+    """
+    required_manifest = {"star_id", "spectrum_file"}
+    missing_manifest = sorted(required_manifest.difference(manifest.columns))
+    if missing_manifest:
+        raise ValueError(
+            "spectrophotometric_standards.csv is missing required columns: "
+            + ", ".join(missing_manifest)
+        )
+    if manifest["star_id"].duplicated().any():
+        duplicate_ids = sorted(
+            manifest.loc[manifest["star_id"].duplicated(), "star_id"]
+            .astype(int)
+            .unique()
+        )
+        raise ValueError(
+            "spectrophotometric_standards.csv contains duplicate star_id values: "
+            f"{duplicate_ids}"
+        )
+
+    manifest = manifest.copy()
+    manifest["star_id"] = manifest["star_id"].astype(int)
+    missing_stars = sorted(set(manifest["star_id"]).difference(star_ids))
+    if missing_stars:
+        raise ValueError(
+            "Spectrophotometric standards are absent from the imaging table: "
+            f"{missing_stars}"
+        )
+    manifest = manifest.sort_values("star_id").reset_index(drop=True)
+
+    star_lookup = {int(star_id): i for i, star_id in enumerate(star_ids)}
+    star_standard_spectrum_index = np.full(star_ids.size, -1, dtype=int)
+    standard_sed_flux = np.zeros((len(manifest), wave.size), dtype=float)
+    standard_prism_flux = np.zeros(
+        (len(manifest), prism_wave.size),
+        dtype=float,
+    )
+    required_wave_min = min(
+        float(wave.min()),
+        float(prism_wave.min()) if prism_wave.size else float(wave.min()),
+    )
+    required_wave_max = max(
+        float(wave.max()),
+        float(prism_wave.max()) if prism_wave.size else float(wave.max()),
+    )
+
+    for spectrum_index, row in manifest.iterrows():
+        spectrum_path = Path(str(row["spectrum_file"]))
+        if not spectrum_path.is_absolute():
+            spectrum_path = input_dir / spectrum_path
+        if not spectrum_path.exists():
+            raise FileNotFoundError(
+                f"Missing spectrum for standard star {int(row['star_id'])}: "
+                f"{spectrum_path}"
+            )
+        spectrum = pd.read_csv(spectrum_path)
+        required_columns = {"wavelength_um", "f_lambda_cgs_per_angstrom"}
+        missing_columns = sorted(required_columns.difference(spectrum.columns))
+        if missing_columns:
+            raise ValueError(
+                f"{spectrum_path} is missing required columns: "
+                + ", ".join(missing_columns)
+            )
+        spectrum_wave = spectrum["wavelength_um"].to_numpy(float)
+        spectrum_flux_per_angstrom = spectrum[
+            "f_lambda_cgs_per_angstrom"
+        ].to_numpy(float)
+        if (
+            spectrum_wave.size < 2
+            or not np.all(np.isfinite(spectrum_wave))
+            or np.any(np.diff(spectrum_wave) <= 0.0)
+        ):
+            raise ValueError(
+                f"Standard spectrum wavelengths must be finite and strictly "
+                f"increasing: {spectrum_path}"
+            )
+        if (
+            not np.all(np.isfinite(spectrum_flux_per_angstrom))
+            or np.any(spectrum_flux_per_angstrom <= 0.0)
+        ):
+            raise ValueError(
+                f"Standard f_lambda values must be finite and positive: "
+                f"{spectrum_path}"
+            )
+        if (
+            spectrum_wave[0] > required_wave_min + 1e-12
+            or spectrum_wave[-1] < required_wave_max - 1e-12
+        ):
+            raise ValueError(
+                f"Standard spectrum does not cover {required_wave_min:.6f} to "
+                f"{required_wave_max:.6f} um: {spectrum_path}"
+            )
+
+        # Internal wavelength integrals use microns, so convert
+        # f_lambda[per Angstrom] to f_lambda[per micron].
+        spectrum_flux_per_micron = (
+            spectrum_flux_per_angstrom * ANGSTROM_PER_MICRON
+        )
+        standard_sed_flux[spectrum_index] = np.interp(
+            wave,
+            spectrum_wave,
+            spectrum_flux_per_micron,
+        )
+        if prism_wave.size:
+            standard_prism_flux[spectrum_index] = np.interp(
+                prism_wave,
+                spectrum_wave,
+                spectrum_flux_per_micron,
+            )
+        star_index = star_lookup[int(row["star_id"])]
+        star_standard_spectrum_index[star_index] = spectrum_index
+
+    return (
+        manifest,
+        star_standard_spectrum_index,
+        standard_sed_flux,
+        standard_prism_flux,
+    )
+
+
 def load_data(config: FitConfig) -> DataBundle:
     input_dir = Path(config.input_dir)
     measurements = pd.read_csv(input_dir / "measurements.csv")
     prism_path = input_dir / "prism_measurements.csv"
     prism_measurements = pd.read_csv(prism_path) if prism_path.exists() else pd.DataFrame()
+    standard_manifest_path = input_dir / "spectrophotometric_standards.csv"
+    legacy_calibrator_path = input_dir / "stellar_calibrators.csv"
+    if standard_manifest_path.exists():
+        standard_manifest = pd.read_csv(standard_manifest_path)
+    elif legacy_calibrator_path.exists():
+        raise FileNotFoundError(
+            "Legacy stellar_calibrators.csv is no longer a valid calibration "
+            "input. Rerun the simulator or provide "
+            "spectrophotometric_standards.csv plus physical f_lambda files."
+        )
+    else:
+        standard_manifest = pd.DataFrame(columns=["star_id", "spectrum_file"])
     if config.max_stars is not None:
         keep_star_ids = np.sort(measurements["star_id"].unique())[: config.max_stars]
-        calibrator_path = input_dir / "stellar_calibrators.csv"
-        if calibrator_path.exists():
-            calibrator_ids = pd.read_csv(calibrator_path, usecols=["star_id"])[
-                "star_id"
-            ].to_numpy(int)
-            keep_star_ids = np.unique(np.r_[keep_star_ids, calibrator_ids])
+        if not standard_manifest.empty:
+            standard_ids = standard_manifest["star_id"].to_numpy(int)
+            keep_star_ids = np.unique(np.r_[keep_star_ids, standard_ids])
         measurements = measurements.loc[measurements["star_id"].isin(keep_star_ids)].copy()
         measurements.reset_index(drop=True, inplace=True)
         if not prism_measurements.empty:
@@ -523,25 +673,41 @@ def load_data(config: FitConfig) -> DataBundle:
         path = input_dir / name
         return pd.read_csv(path) if path.exists() else None
 
-    absolute_calibrators = read_optional("stellar_calibrators.csv")
-    star_is_calibrator = np.zeros(star_ids.size, dtype=bool)
-    if absolute_calibrators is not None and not absolute_calibrators.empty:
-        required = {"star_id", "mag_norm"}
-        required.update(f"sed_coeff_{i}" for i in range(sed_library.n_components))
-        missing = sorted(required.difference(absolute_calibrators.columns))
-        if missing:
-            raise ValueError(
-                "stellar_calibrators.csv is missing required columns: "
-                + ", ".join(missing)
+    (
+        standard_manifest,
+        star_standard_spectrum_index,
+        standard_sed_flux,
+        standard_prism_flux,
+    ) = load_spectrophotometric_standards(
+        input_dir,
+        standard_manifest,
+        star_ids,
+        wave,
+        prism_wave,
+    )
+    star_is_calibrator = star_standard_spectrum_index >= 0
+    manifest_standard_ids = set(standard_manifest["star_id"].to_numpy(int))
+    for table_name, table in (
+        ("measurements.csv", measurements),
+        ("prism_measurements.csv", prism_measurements),
+    ):
+        if (
+            not table.empty
+            and "is_spectrophotometric_standard" in table.columns
+        ):
+            flagged_ids = set(
+                table.loc[
+                    table["is_spectrophotometric_standard"].astype(bool),
+                    "star_id",
+                ].to_numpy(int)
             )
-        calibrator_star_ids = set(absolute_calibrators["star_id"].to_numpy(int))
-        star_is_calibrator = np.array(
-            [int(star_id) in calibrator_star_ids for star_id in star_ids],
-            dtype=bool,
-        )
-        absolute_calibrators = absolute_calibrators.loc[
-            absolute_calibrators["star_id"].isin(star_ids)
-        ].copy()
+            if flagged_ids != manifest_standard_ids.intersection(
+                set(table["star_id"].to_numpy(int))
+            ):
+                raise ValueError(
+                    f"{table_name} standard-star flags do not match "
+                    "spectrophotometric_standards.csv"
+                )
 
     free_star_indices = np.nonzero(~star_is_calibrator)[0]
     free_star_index = np.full(star_ids.size, -1, dtype=int)
@@ -588,8 +754,11 @@ def load_data(config: FitConfig) -> DataBundle:
         free_exposure_ids=free_exposure_ids,
         exposure_free_index=exposure_free_index,
         star_is_calibrator=star_is_calibrator,
+        star_standard_spectrum_index=star_standard_spectrum_index,
         free_star_indices=free_star_indices,
         free_star_index=free_star_index,
+        standard_sed_flux=standard_sed_flux,
+        standard_prism_flux=standard_prism_flux,
         passbands=passbands,
         reference_filter_index=reference_filter_index,
         phi_shift=phi_shift,
@@ -599,7 +768,7 @@ def load_data(config: FitConfig) -> DataBundle:
         ice_thickness_nodes=ice_thickness_nodes,
         ice_loglam_basis=ice_loglam_basis,
         filter_effective_wavelength=filter_eff,
-        absolute_calibrators=absolute_calibrators,
+        standard_manifest=standard_manifest,
         true_star_params=read_optional("true_star_params.csv"),
         true_passband_params=read_optional("true_passband_params.csv"),
         true_ice_spline_params=read_optional("true_ice_spline_params.csv"),
@@ -641,16 +810,6 @@ def fit_initial_stellar_seds(data: DataBundle, config: FitConfig) -> ModelState:
 
     mag_norm = np.zeros(data.star_ids.size)
     sed_coeff = np.zeros((data.star_ids.size, data.sed_library.n_components))
-
-    if data.absolute_calibrators is not None and not data.absolute_calibrators.empty:
-        coeff_cols = [f"sed_coeff_{i}" for i in range(data.sed_library.n_components)]
-        calibrators = data.absolute_calibrators.set_index("star_id")
-        for star_index, star_id in enumerate(data.star_ids):
-            if not data.star_is_calibrator[star_index]:
-                continue
-            row = calibrators.loc[star_id]
-            mag_norm[star_index] = float(row["mag_norm"])
-            sed_coeff[star_index] = row[coeff_cols].to_numpy(float)
 
     for star_index in range(data.star_ids.size):
         if data.star_is_calibrator[star_index]:
@@ -758,6 +917,12 @@ def evaluate_model_and_responses(
             state.mag_norm[star],
             reference_passband,
         )
+        standard_index = data.star_standard_spectrum_index[star]
+        standard_rows = standard_index >= 0
+        if np.any(standard_rows):
+            sed[standard_rows] = data.standard_sed_flux[
+                standard_index[standard_rows]
+            ]
         logt = (
             state.shift[filt, det][:, None] * data.phi_shift[filt]
             + state.width[filt, det][:, None] * data.phi_width[filt]
@@ -810,6 +975,10 @@ def evaluate_model_and_responses(
                 / ref_denom
             )
             d_sed_coeff[sl, component_id] = -MAG_FACTOR * (obs_mean - ref_mean)
+        if np.any(standard_rows):
+            chunk_rows = np.nonzero(standard_rows)[0] + start
+            d_norm[chunk_rows] = 0.0
+            d_sed_coeff[chunk_rows] = 0.0
 
         r_shift[sl] = -MAG_FACTOR * (
             photon_count_integral(weighted * data.phi_shift[filt], data.wave, axis=1) / denom
@@ -895,6 +1064,13 @@ def evaluate_prism_model_and_responses(
         axis=1,
     )
     sed_flux_density = amplitude[star] * np.exp(log_shape)
+    standard_index = data.star_standard_spectrum_index[star]
+    standard_rows = standard_index >= 0
+    if np.any(standard_rows):
+        sed_flux_density[standard_rows] = data.standard_prism_flux[
+            standard_index[standard_rows],
+            pixel[standard_rows],
+        ]
 
     thickness = data.prism_measurements["ice_thickness"].to_numpy(float)
     lo, hi, w_lo, w_hi = thickness_brackets(thickness, data.ice_thickness_nodes)
@@ -937,6 +1113,7 @@ def evaluate_prism_model_and_responses(
         d_sed_coeff = -MAG_FACTOR * (
             data.prism_components[:, pixel].T - reference_component_mean[star]
         )
+        d_sed_coeff[standard_rows] = 0.0
         for obs_index in range(n_obs):
             for loglam_id in np.nonzero(loglam_basis[obs_index])[0]:
                 r_ice[obs_index, lo[obs_index] * n_loglam + loglam_id] += (
@@ -948,7 +1125,7 @@ def evaluate_prism_model_and_responses(
 
     return PrismLinearization(
         mag_model=mag_model,
-        d_norm=np.ones(n_obs),
+        d_norm=(~standard_rows).astype(float),
         d_sed_coeff=d_sed_coeff,
         r_ice=r_ice,
     )
@@ -1669,6 +1846,21 @@ def run_fit(
         progress_metrics.append(f"d={accepted_damping:.3f}")
         iteration_progress.set_postfix_str(" ".join(progress_metrics))
 
+        iteration_details = [f"imaging RMS = {rms(resid):.6f} mag"]
+        if prism_resid.size:
+            iteration_details.append(
+                f"prism RMS = {rms(prism_resid):.6f} mag"
+            )
+        iteration_details.extend(
+            [
+                f"damping = {accepted_damping:.5f}",
+                f"LSMR iterations = {result[2]}",
+            ]
+        )
+        iteration_progress.write(
+            f"Iteration {iteration}: " + ", ".join(iteration_details)
+        )
+
     final_lin = evaluate_model_and_responses(data, state, config, need_responses=False)
     final_prism_lin = evaluate_prism_model_and_responses(
         data, state, config, need_responses=False
@@ -1764,20 +1956,52 @@ def save_outputs(
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    standard_mask = data.star_is_calibrator
+    output_mag_norm = state.mag_norm.copy()
+    output_mag_norm[standard_mask] = np.nan
+    standard_spectrum_file = np.full(data.star_ids.size, "", dtype=object)
+    derived_reference_ab_mag = np.full(data.star_ids.size, np.nan)
+    if np.any(standard_mask):
+        standard_indices = data.star_standard_spectrum_index[standard_mask]
+        standard_spectrum_file[standard_mask] = data.standard_manifest.iloc[
+            standard_indices
+        ]["spectrum_file"].to_numpy(str)
+        reference_passband = data.passbands[data.reference_filter_index]
+        standard_counts = photon_count_integral(
+            data.standard_sed_flux * reference_passband[None, :],
+            data.wave,
+            axis=1,
+        )
+        derived_reference_ab_mag[standard_mask] = flux_to_abmag(
+            standard_counts,
+            data.wave,
+            reference_passband,
+        )
+
     star_payload = {
         "star_id": data.star_ids,
-        "is_absolute_calibrator": data.star_is_calibrator,
-        "mag_norm": state.mag_norm,
+        "is_absolute_calibrator": standard_mask,
+        "is_spectrophotometric_standard": standard_mask,
+        "sed_model_type": np.where(
+            standard_mask,
+            "fixed_f_lambda_file",
+            "fitted_bosz_empca",
+        ),
+        "standard_spectrum_file": standard_spectrum_file,
+        "derived_reference_ab_mag": derived_reference_ab_mag,
+        "mag_norm": output_mag_norm,
     }
     if param_sigma is not None and slices is not None:
-        mag_norm_sigma = np.zeros(data.star_ids.size)
+        mag_norm_sigma = np.full(data.star_ids.size, np.nan)
         mag_norm_sigma[data.free_star_indices] = param_sigma[slices["norm"]]
         star_payload["mag_norm_sigma"] = mag_norm_sigma
     for component_id in range(data.sed_library.n_components):
-        star_payload[f"sed_coeff_{component_id}"] = state.sed_coeff[:, component_id]
+        output_coeff = state.sed_coeff[:, component_id].copy()
+        output_coeff[standard_mask] = np.nan
+        star_payload[f"sed_coeff_{component_id}"] = output_coeff
         if param_sigma is not None and slices is not None:
             sigma_start = slices["sed_coeff"].start + component_id
-            coeff_sigma = np.zeros(data.star_ids.size)
+            coeff_sigma = np.full(data.star_ids.size, np.nan)
             coeff_sigma[data.free_star_indices] = param_sigma[
                 sigma_start : slices["sed_coeff"].stop : data.sed_library.n_components
             ]
@@ -2003,7 +2227,10 @@ def print_diagnostics(
     print(f"Number of imaging observations: {len(data.measurements)}")
     print(f"Number of prism wavelength pixels: {len(data.prism_measurements)}")
     print(f"Number of stars: {data.star_ids.size}")
-    print(f"Number of fixed absolute calibrator stars: {int(data.star_is_calibrator.sum())}")
+    print(
+        "Number of fixed physical standard-star spectra: "
+        f"{int(data.star_is_calibrator.sum())}"
+    )
     print(f"Number of fitted stars: {data.free_star_indices.size}")
     print(f"Number of filters: {data.filter_ids.size}")
     print(f"Number of detectors: {data.detector_ids.size}")
@@ -2071,12 +2298,16 @@ def print_diagnostics(
         fit_centered = state.amp_offset - state.amp_offset.mean(axis=1, keepdims=True)
         true_centered = true_amp - true_amp.mean(axis=1, keepdims=True)
         print(f"Amp offset RMS error, detector means removed: {rms(fit_centered - true_centered):.6f} mag")
-    if data.true_star_params is not None:
+    if data.true_star_params is not None and data.free_star_indices.size:
         coeff_cols = [f"sed_coeff_{i}" for i in range(data.sed_library.n_components)]
         if all(col in data.true_star_params.columns for col in coeff_cols):
             truth = data.true_star_params.set_index("star_id").loc[data.star_ids]
             true_coeff = truth[coeff_cols].to_numpy(float)
-            print(f"Stellar EMPCA coefficient RMS error: {rms(state.sed_coeff - true_coeff):.6f}")
+            free = data.free_star_indices
+            print(
+                "Field-star EMPCA coefficient RMS error: "
+                f"{rms(state.sed_coeff[free] - true_coeff[free]):.6f}"
+            )
     if param_sigma is not None and slices is not None:
         ice_sigma = param_sigma[slices["ice"]]
         print(f"Median formal ice-node uncertainty: {np.median(ice_sigma):.6f}")
@@ -2708,7 +2939,7 @@ def make_plots(
     plt.savefig(output_dir / "residual_vs_amp.png", dpi=160)
     plt.close()
 
-    if data.true_star_params is not None:
+    if data.true_star_params is not None and data.free_star_indices.size:
         truth = data.true_star_params.set_index("star_id").loc[data.star_ids]
         coeff_cols = [f"sed_coeff_{i}" for i in range(data.sed_library.n_components)]
         if all(col in truth.columns for col in coeff_cols):
@@ -2732,43 +2963,30 @@ def make_plots(
                 squeeze=False,
             )
             free_mask = ~data.star_is_calibrator
-            calib_mask = data.star_is_calibrator
             for col_index, (label, true_values, fit_values) in enumerate(parameters):
                 recovery_ax = axes[0, col_index]
                 residual_ax = axes[1, col_index]
                 residual = fit_values - true_values
 
                 recovery_ax.scatter(true_values[free_mask], fit_values[free_mask], s=5, alpha=0.35)
-                if np.any(calib_mask):
-                    recovery_ax.scatter(
-                        true_values[calib_mask],
-                        fit_values[calib_mask],
-                        s=24,
-                        facecolors="none",
-                        edgecolors="crimson",
-                        linewidths=0.8,
-                    )
-                vmin = min(true_values.min(), fit_values.min())
-                vmax = max(true_values.max(), fit_values.max())
+                vmin = min(
+                    true_values[free_mask].min(),
+                    fit_values[free_mask].min(),
+                )
+                vmax = max(
+                    true_values[free_mask].max(),
+                    fit_values[free_mask].max(),
+                )
                 recovery_ax.plot([vmin, vmax], [vmin, vmax], color="0.2", linewidth=1)
                 recovery_ax.set_title(label)
                 recovery_ax.set_xlabel(f"True {label}")
                 recovery_ax.set_ylabel(f"Fitted {label}")
 
                 residual_ax.scatter(true_values[free_mask], residual[free_mask], s=5, alpha=0.35)
-                if np.any(calib_mask):
-                    residual_ax.scatter(
-                        true_values[calib_mask],
-                        residual[calib_mask],
-                        s=24,
-                        facecolors="none",
-                        edgecolors="crimson",
-                        linewidths=0.8,
-                    )
                 residual_ax.axhline(0.0, color="0.2", linewidth=1)
                 residual_ax.set_xlabel(f"True {label}")
                 residual_ax.set_ylabel("Fit - true")
-            plt.suptitle("Stellar BOSZ EMPCA parameter recovery")
+            plt.suptitle("Field-star BOSZ EMPCA parameter recovery")
             plt.tight_layout()
             plt.savefig(output_dir / "stellar_param_recovery.png", dpi=160)
             plt.close()

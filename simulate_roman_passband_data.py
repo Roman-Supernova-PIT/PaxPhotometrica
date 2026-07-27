@@ -11,6 +11,10 @@ spectra. Imaging smooth focal-plane fields vary by filter and detector, prism
 smooth fields vary by wavelength pixel and detector, and all measurements
 share the same detector/amplifier gains.
 
+Absolute standards are exported as independent physical
+``f_lambda``-versus-wavelength CSV files. Their generating EMPCA coordinates
+remain simulator truth only and are not calibration inputs.
+
 Throughput perturbations are modeled in log-throughput space because small
 multiplicative throughput changes then add linearly. Observations are still
 generated from linear broadband flux integrals, which is the physical
@@ -40,6 +44,7 @@ import pandas as pd
 
 SPEED_OF_LIGHT_CM_S = 2.99792458e10
 MICRON_TO_CM = 1.0e-4
+ANGSTROM_PER_MICRON = 1.0e4
 AB_FNU_CGS = 3631.0e-23  # erg / s / cm^2 / Hz
 
 
@@ -493,7 +498,6 @@ def read_prism_wavelength_grid(
     edges[1:-1] = 0.5 * (wavelength[:-1] + wavelength[1:])
     edges[0] = wavelength[0] - 0.5 * (wavelength[1] - wavelength[0])
     edges[-1] = wavelength[-1] + 0.5 * (wavelength[-1] - wavelength[-2])
-    bin_width = np.diff(edges)
 
     # A smooth, dimensionless nominal prism envelope. Its absolute normalization
     # is arbitrary because a wavelength-dependent spectrophotometric response
@@ -634,10 +638,85 @@ def write_ice_spline_files(
     pd.DataFrame(true_rows).to_csv(output_dir / "true_ice_spline_params.csv", index=False)
 
 
+def write_spectrophotometric_standard_files(
+    output_dir: Path,
+    wave_um: np.ndarray,
+    sed_flux: np.ndarray,
+    standard_star_ids: np.ndarray,
+) -> pd.DataFrame:
+    """Write one physical f_lambda spectrum per absolute standard.
+
+    The EMPCA coefficients and reference magnitude used to create the simulated
+    SED remain truth metadata only. Calibration consumes these sampled physical
+    flux-density files, just as it would for real spectrophotometric standards.
+    """
+    spectrum_dir = output_dir / "standard_spectra"
+    spectrum_dir.mkdir(parents=True, exist_ok=True)
+    for old_spectrum in spectrum_dir.glob("standard_star_*.csv"):
+        old_spectrum.unlink()
+    manifest_rows = []
+    for star_id in np.asarray(standard_star_ids, dtype=int):
+        relative_path = Path("standard_spectra") / f"standard_star_{star_id:06d}.csv"
+        pd.DataFrame(
+            {
+                "wavelength_um": wave_um,
+                "f_lambda_cgs_per_angstrom": (
+                    sed_flux[star_id] / ANGSTROM_PER_MICRON
+                ),
+            }
+        ).to_csv(output_dir / relative_path, index=False, float_format="%.12e")
+        manifest_rows.append(
+            {
+                "star_id": star_id,
+                "spectrum_file": relative_path.as_posix(),
+            }
+        )
+
+    manifest = pd.DataFrame(
+        manifest_rows,
+        columns=["star_id", "spectrum_file"],
+    )
+    manifest.to_csv(output_dir / "spectrophotometric_standards.csv", index=False)
+    return manifest
+
+
+def make_standard_spectra_plot(
+    output_dir: Path,
+    wave_um: np.ndarray,
+    sed_flux: np.ndarray,
+    standard_star_ids: np.ndarray,
+) -> None:
+    """Plot the physical f_lambda files supplied to the fitter."""
+    if len(standard_star_ids) == 0:
+        (output_dir / "sim_standard_spectra.png").unlink(missing_ok=True)
+        return
+    plt.figure(figsize=(8, 5))
+    for star_id in np.asarray(standard_star_ids, dtype=int):
+        plt.plot(
+            wave_um,
+            sed_flux[star_id] / ANGSTROM_PER_MICRON,
+            label=f"star {star_id}",
+        )
+    plt.yscale("log")
+    plt.xlabel("Wavelength [um]")
+    plt.ylabel(
+        r"$f_\lambda$ [erg cm$^{-2}$ s$^{-1}$ Angstrom$^{-1}$]"
+    )
+    plt.title("Simulated spectrophotometric-standard inputs")
+    plt.legend(fontsize=8)
+    plt.tight_layout()
+    plt.savefig(output_dir / "sim_standard_spectra.png", dpi=160)
+    plt.close()
+
+
 def simulate_data(config: SimConfig) -> None:
     rng = np.random.default_rng(config.random_seed)
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    # This legacy parameter table is intentionally replaced by physical
+    # spectrum files. Remove a stale simulator artifact when reusing an output
+    # directory so it cannot be mistaken for a supported fitter input.
+    (output_dir / "stellar_calibrators.csv").unlink(missing_ok=True)
 
     wave, passbands, filter_centers, filter_names = read_nominal_passbands(config)
     if not 0 <= config.reference_filter_id < passbands.shape[0]:
@@ -708,6 +787,7 @@ def simulate_data(config: SimConfig) -> None:
         "y": star_base_y,
         "mag_norm": true_mag_norm,
         "is_absolute_calibrator": is_calibrator,
+        "is_spectrophotometric_standard": is_calibrator,
         "bosz_model_index": true_model_index,
         "bosz_model_file": sed_library.model_files[true_model_index],
     }
@@ -715,7 +795,6 @@ def simulate_data(config: SimConfig) -> None:
         star_param_payload[f"sed_coeff_{component_id}"] = true_sed_coeff[:, component_id]
     star_params = pd.DataFrame(star_param_payload)
     star_params.to_csv(output_dir / "true_star_params.csv", index=False)
-    star_params.loc[is_calibrator].to_csv(output_dir / "stellar_calibrators.csv", index=False)
 
     pass_rows = []
     for filt in range(config.n_filter):
@@ -820,6 +899,18 @@ def simulate_data(config: SimConfig) -> None:
     sed_all = sed_library.sed_from_coefficients(
         true_sed_coeff, true_mag_norm, reference_passband
     )
+    write_spectrophotometric_standard_files(
+        output_dir,
+        wave,
+        sed_all,
+        calibrator_ids,
+    )
+    make_standard_spectra_plot(
+        output_dir,
+        wave,
+        sed_all,
+        calibrator_ids,
+    )
 
     rows = []
     obs_id = 0
@@ -912,6 +1003,9 @@ def simulate_data(config: SimConfig) -> None:
                     "true_smooth_delta_mag": smooth_delta,
                     "true_amp_delta_mag": amp_delta,
                     "true_scalar_delta_mag": scalar_delta,
+                    "is_spectrophotometric_standard": bool(
+                        is_calibrator[star_id]
+                    ),
                 }
             )
             obs_id += 1
@@ -1078,7 +1172,36 @@ def simulate_data(config: SimConfig) -> None:
                     prism_obs_id += 1
                 spectrum_id += 1
 
-    pd.DataFrame(prism_rows).to_csv(output_dir / "prism_measurements.csv", index=False)
+    prism_columns = [
+        "prism_obs_id",
+        "spectrum_id",
+        "star_id",
+        "exposure_id",
+        "epoch_id",
+        "detector_id",
+        "amp_id",
+        "wavelength_pixel_id",
+        "wavelength_um",
+        "bin_width_um",
+        "x",
+        "y",
+        "ice_thickness",
+        "mag_obs",
+        "mag_unc",
+        "mag_true_no_noise",
+        "true_ab_mag",
+        "true_prism_response_mag",
+        "true_ice_logt",
+        "true_zp_delta_mag",
+        "true_smooth_delta_mag",
+        "true_amp_delta_mag",
+        "true_scalar_delta_mag",
+        "is_spectrophotometric_standard",
+    ]
+    pd.DataFrame(prism_rows, columns=prism_columns).to_csv(
+        output_dir / "prism_measurements.csv",
+        index=False,
+    )
 
     metadata = asdict(config)
     metadata["wave_min"] = float(wave.min())
@@ -1102,6 +1225,13 @@ def simulate_data(config: SimConfig) -> None:
     metadata["n_ice_loglam_nodes"] = int(loglam_nodes.size)
     metadata["n_ice_thickness_nodes"] = int(thickness_nodes.size)
     metadata["n_absolute_calibrator"] = int(n_calibrator)
+    metadata["spectrophotometric_standard_manifest"] = (
+        "spectrophotometric_standards.csv"
+    )
+    metadata["spectrophotometric_standard_wavelength_unit"] = "micron"
+    metadata["spectrophotometric_standard_flux_unit"] = (
+        "erg cm^-2 s^-1 Angstrom^-1"
+    )
     metadata["n_obs"] = len(rows)
     metadata["prism_wavelength_input_unit"] = "Angstrom"
     metadata["prism_wavelength_output_unit"] = "micron"
@@ -1217,7 +1347,13 @@ def parse_args() -> SimConfig:
     parser.add_argument("--prism-star-fraction", type=float, default=SimConfig.prism_star_fraction)
     parser.add_argument("--sed-basis-path", default=SimConfig.sed_basis_path)
     parser.add_argument("--reference-filter-id", type=int, default=SimConfig.reference_filter_id)
-    parser.add_argument("--n-absolute-calibrator", type=int, default=SimConfig.n_absolute_calibrator)
+    parser.add_argument(
+        "--n-spectrophotometric-standard",
+        "--n-absolute-calibrator",
+        dest="n_absolute_calibrator",
+        type=int,
+        default=SimConfig.n_absolute_calibrator,
+    )
     parser.add_argument("--ice-loglam-nodes-file", default=SimConfig.ice_loglam_nodes_file)
     parser.add_argument("--n-ice-thickness-nodes", type=int, default=SimConfig.n_ice_thickness_nodes)
     parser.add_argument("--ice-thickness-min", type=float, default=SimConfig.ice_thickness_min)

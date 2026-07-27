@@ -302,7 +302,7 @@ Notation:
 - `ice_loglam_nodes.txt`: default log10 wavelength nodes used for the ice
   spline grid. The simulator can read a different node file.
 - `prism wavelengths`: supplied prism pixel-center wavelengths in Angstroms.
-  The simulator converts them to microns; the current file has 193 pixels from
+  The simulator converts them to microns; the current file has 194 pixels from
   0.750 to about 1.796 microns.
 - `simulate_roman_passband_data.py`: generates six-filter photometry using
   `passbands.txt`, BOSZ EMPCA stellar SEDs, passband modes, a 2D ice spline
@@ -330,11 +330,14 @@ Notation:
 - `passband_sim_outputs/true_ice_spline_params.csv`: true ice log-throughput
   values at the spline grid nodes.
 - `passband_sim_outputs/true_star_params.csv`: true star magnitude
-  normalizations, absolute-calibrator flags, selected BOSZ model IDs/files,
-  and `sed_coeff_*` EMPCA coefficients.
-- `passband_sim_outputs/stellar_calibrators.csv`: fixed absolute calibration
-  stars with known `mag_norm` and `sed_coeff_*` values. These stars are used by
-  the fitter but do not get stellar nuisance-parameter columns.
+  normalizations, standard-star flags, selected BOSZ model IDs/files, and
+  `sed_coeff_*` EMPCA coefficients. This is simulator truth used only for
+  diagnostics; it is not a calibration input.
+- `passband_sim_outputs/spectrophotometric_standards.csv`: standard-star
+  manifest containing only `star_id` and `spectrum_file`.
+- `passband_sim_outputs/standard_spectra/*.csv`: one physical spectrum per
+  standard, with columns `wavelength_um` and
+  `f_lambda_cgs_per_angstrom`.
 - `passband_sim_outputs/true_passband_params.csv`: true detector-level
   passband shift and width coefficients.
 - `passband_sim_outputs/true_exposure_zeropoints.csv`: true scalar exposure
@@ -348,9 +351,11 @@ Notation:
   additive magnitude offsets.
 - `passband_fit_outputs/fit_*params.csv`: recovered stellar, passband, ice, and
   scalar focal-plane parameters.
-- `passband_fit_outputs/fit_star_params.csv`: recovered star magnitude
+- `passband_fit_outputs/fit_star_params.csv`: recovered field-star magnitude
   normalizations and `sed_coeff_*` EMPCA coefficients, with formal
-  `mag_norm` and coefficient sigmas from LSQR when available.
+  uncertainties from LSQR. Standard rows identify their physical spectrum
+  files and report a derived reference-band AB magnitude; their fitted
+  magnitude and EMPCA fields are blank because those parameters do not exist.
 - `passband_fit_outputs/fit_ice_spline_params.csv`: recovered ice spline node
   values and formal node uncertainties from the final LSQR variance estimate.
 - `passband_fit_outputs/fit_exposure_zeropoints.csv`: recovered scalar
@@ -387,6 +392,8 @@ Notation:
   shows every fitted spatial coefficient versus wavelength and
   `prism_smooth_field_samples.png` compares true, fitted, and residual fields
   at representative wavelengths.
+- `passband_sim_outputs/sim_standard_spectra.png`: physical `f_lambda` inputs
+  for the simulated spectrophotometric standards.
 
 ### Run
 
@@ -397,7 +404,9 @@ Notation:
 
 The fitter displays a `tqdm` progress bar over the requested nonlinear
 iterations. Its compact postfix reports imaging RMS (`i`), prism RMS (`p`), and
-the accepted damping factor (`d`) from the latest completed iteration.
+the accepted damping factor (`d`) from the latest completed iteration. A
+persistent line is also printed after every iteration with the separate imaging
+and prism RMS values, damping, and number of LSMR iterations.
 
 Useful fitter options:
 
@@ -415,6 +424,10 @@ Useful simulator prism options:
 /opt/anaconda3/bin/python simulate_roman_passband_data.py --n-prism-exp 4
 /opt/anaconda3/bin/python simulate_roman_passband_data.py --prism-star-fraction 0.01
 ```
+
+Set `--n-prism-exp 0` for an imaging-only simulation; the simulator still
+writes an empty `prism_measurements.csv` with a valid schema, and the fitter
+skips prism parameters and diagnostics.
 
 Query a fitted calibration for one instrumental measurement:
 
@@ -460,13 +473,13 @@ Useful simulator options:
 /opt/anaconda3/bin/python simulate_roman_passband_data.py --ice-thickness-min 0.0 --ice-thickness-max 1.5
 /opt/anaconda3/bin/python simulate_roman_passband_data.py --sed-basis-path bosz_logflux_empca_basis.npz
 /opt/anaconda3/bin/python simulate_roman_passband_data.py --reference-filter-id 3
-/opt/anaconda3/bin/python simulate_roman_passband_data.py --n-absolute-calibrator 5
+/opt/anaconda3/bin/python simulate_roman_passband_data.py --n-spectrophotometric-standard 5
 ```
 
 The default simulator uses one detector, 32 amplifier stripes, six supplied
-Roman passbands, `2,000` stars, `5` fixed absolute calibrator stars, and `30`
-exposures. The exposure pattern includes translations and rotations, so stars
-move across the smooth focal-plane and amplifier terms.
+Roman passbands, `2,000` stars, `5` fixed physical spectrophotometric-standard
+spectra, and `30` imaging exposures. The exposure pattern includes translations
+and rotations, so stars move across the smooth focal-plane and amplifier terms.
 
 ### Stellar SED Basis
 
@@ -497,19 +510,49 @@ parameters. The current basis file in this directory has 4 EMPCA components and
 those stored coefficient vectors so the synthetic colors remain on the BOSZ
 training manifold.
 
-A small subset of stars is written to `stellar_calibrators.csv` as absolute
-calibrators. For those stars, `mag_norm` and all `sed_coeff_*` values are
-assumed known exactly by this prototype. The fitter uses their fixed SEDs in
-the forward model and omits their stellar normalization/coefficient update
-columns from the sparse least-squares system.
+A small subset is designated as spectrophotometric standards. The simulator
+first constructs their physical flux density in
+`erg cm^-2 s^-1 Angstrom^-1`, then writes each one as an independent
+`f_lambda`-versus-wavelength CSV. The fitter reads those spectra directly and
+omits magnitude-normalization and EMPCA update columns for those stars. It
+never uses the standards' simulator-truth `mag_norm` or `sed_coeff_*` values.
+
+### Spectrophotometric Standard Inputs
+
+`spectrophotometric_standards.csv` is the only standard-star manifest consumed
+by the fitter:
+
+```text
+star_id,spectrum_file
+228,standard_spectra/standard_star_000228.csv
+```
+
+Each referenced spectrum is a CSV with exactly the physical coordinates needed
+by synthetic photometry:
+
+```text
+wavelength_um,f_lambda_cgs_per_angstrom
+0.473,1.200509116574e-16
+0.474,1.191627825783e-16
+```
+
+Wavelengths must be finite, strictly increasing, and cover both the imaging
+passband grid and the fixed prism wavelength grid. Flux densities must be
+finite and positive and are interpreted as
+`erg cm^-2 s^-1 Angstrom^-1`. Relative paths are resolved from the simulator
+input directory. The fitter validates these conditions and also checks that
+measurement-table standard flags agree with the manifest.
+
+The simulator still records each standard's generating BOSZ model,
+normalization, and EMPCA coordinates in `true_star_params.csv`, but that file
+is optional truth for recovery plots only. Deleting it does not change the fit.
 
 ### Synthetic Photometry And AB Zeropoints
 
-The measurement table now stores instrumental magnitudes, while the absolute
-calibrator stars still carry known AB magnitudes and BOSZ EMPCA SED
-coefficients. This mirrors the real use case: most stars provide relative
-instrumental constraints, and a small set of spectrophotometric standards sets
-the physical AB scale.
+The measurement table stores instrumental magnitudes. Most stars provide
+relative constraints through fitted BOSZ EMPCA shapes and normalizations,
+whereas the standards provide physical `f_lambda` spectra and therefore set the
+absolute AB scale without any fitted stellar parameters.
 
 The BOSZ EMPCA basis provides relative SED shapes, so the simulator assigns
 each star an amplitude by requiring `mag_norm` to be that star's AB magnitude
@@ -599,10 +642,10 @@ so `mag_obs + ZP_AB,prism(obs)` is the calibrated narrow-bin AB magnitude.
 `fit_prism_residuals.csv` stores both this zeropoint and the resulting
 `calibrated_ab_mag` for every simulated spectral pixel.
 
-For real spectrophotometric standard stars with physical `f_lambda` values, the
-same photon-counting AB convention can be used directly. The simulated BOSZ
-stars use `mag_norm` only to supply the absolute normalization removed by the
-EMPCA preprocessing.
+The same photon-counting AB convention is used for the physical standard-star
+files and the EMPCA field stars. For field stars, `mag_norm` supplies the
+absolute normalization removed by EMPCA preprocessing. For standards, the
+sampled physical `f_lambda` values supply both shape and normalization directly.
 
 ### Measurement Table
 
@@ -633,6 +676,7 @@ true_zp_delta_mag
 true_smooth_delta_mag
 true_amp_delta_mag
 true_scalar_delta_mag
+is_spectrophotometric_standard
 ```
 
 `ice_thickness` is treated as known input to the fitter. `ice_amount_obs` is
@@ -676,6 +720,9 @@ Column meanings:
 - `true_smooth_delta_mag`: true smooth focal-plane contribution.
 - `true_amp_delta_mag`: true amplifier offset contribution.
 - `true_scalar_delta_mag`: sum of true zeropoint, smooth, and amp terms.
+- `is_spectrophotometric_standard`: true when `star_id` is listed in
+  `spectrophotometric_standards.csv` and its SED is supplied by a physical
+  `f_lambda` file.
 
 `passband_sim_outputs/prism_measurements.csv` has one row per wavelength pixel
 in one extracted spectrum:
@@ -716,11 +763,11 @@ Thus a single spectrum never crosses an amplifier boundary. A dither may move
 the whole trace onto a different amplifier in another exposure, which supplies
 relative constraints on the same amplifier gains used by all six filters.
 
-All five default absolute calibrators receive prism spectra. Their `mag_norm`
-and BOSZ EMPCA coefficients remain fixed, so they act as spectrophotometric
-standards and determine the absolute wavelength-dependent prism
-spectrophotometric response. They do not constrain or update the wavelength
-assigned to any detector pixel.
+All five default standards receive prism spectra. Their physical `f_lambda`
+files are used directly, so they determine the absolute wavelength-dependent
+prism spectrophotometric response without fitted stellar magnitudes or EMPCA
+coordinates. They do not constrain or update the wavelength assigned to any
+detector pixel.
 The other prism targets use the same free stellar parameters as their imaging
 measurements.
 
@@ -729,13 +776,13 @@ measurements.
 Iteration 0 fits initial stellar SED parameters star-by-star using nominal
 passbands and ignoring passband/ice perturbations. It searches over the BOSZ
 EMPCA coefficient vectors stored in the basis file and solves each star's
-magnitude normalization analytically for non-calibrator stars. Absolute
-calibrator stars are initialized from `stellar_calibrators.csv` and held fixed.
-Later iterations build a sparse linearized system for magnitude residuals and
-solve updates for:
+magnitude normalization analytically for field stars. Standards bypass this
+search: their physical spectra are interpolated once onto the imaging and prism
+grids and then held fixed. Later iterations build a sparse linearized system
+for magnitude residuals and solve updates for:
 
-- per-star magnitude normalization for non-calibrator stars,
-- per-star BOSZ EMPCA SED coefficients for non-calibrator stars,
+- per-star magnitude normalization for non-standard field stars,
+- per-star BOSZ EMPCA SED coefficients for non-standard field stars,
 - per-filter/per-detector passband shift,
 - per-filter/per-detector passband width,
 - global ice log-throughput spline node values.
@@ -826,37 +873,38 @@ log-throughput perturbation.
 
 A default run currently produces `45,532` imaging observations and `14,125`
 prism wavelength-pixel measurements from `75` extracted spectra. The prism
-targets are 1% of the 2,000-star sample, including all `5` fixed absolute
-calibrators. The fit solves `11,290` linearized update parameters per iteration.
+targets are 1% of the 2,000-star sample, including all `5` physical
+spectrophotometric standards. The fit solves `11,290` linearized update
+parameters per iteration.
 The verified iteration summary is:
 
 ```text
 iteration  combined RMS  imaging RMS  prism RMS  accepted damping
-0          0.031705      0.028457     0.040437   0.0000
-1          0.029405      0.026049     0.038271   0.0625
-2          0.026553      0.023654     0.034267   0.1250
-3          0.024330      0.023246     0.027537   0.2500
-4          0.020872      0.021460     0.018852   0.5000
-5          0.013065      0.012043     0.015918   0.5000
-6          0.009751      0.007354     0.015075   0.5000
-7          0.008710      0.005569     0.014847   0.5000
+0          0.031690      0.028457     0.040387   0.0000
+1          0.029390      0.026048     0.038223   0.0625
+2          0.026542      0.023657     0.034226   0.1250
+3          0.024325      0.023250     0.027507   0.2500
+4          0.020875      0.021466     0.018840   0.5000
+5          0.013065      0.012046     0.015913   0.5000
+6          0.009751      0.007356     0.015074   0.5000
+7          0.008709      0.005569     0.014846   0.5000
 8          0.008422      0.005015     0.014783   0.5000
 ```
 
 Final default diagnostics:
 
 ```text
-Passband shift RMS error: 0.008800 um
+Passband shift RMS error: 0.008799 um
 Passband width RMS error: 0.055003
-Ice log-throughput surface RMS error: 0.025236
-Prism spectrophotometric-response RMS error: 0.002179 mag
-Exposure ZP RMS error: 0.122851 mag
-Imaging smooth-coefficient RMS error: 0.002012 mag
-Prism smooth-coefficient RMS error: 0.003158 mag
-Amp offset RMS error, detector means removed: 0.001157 mag
-Stellar EMPCA coefficient RMS error: 0.155726
-Median formal ice-node uncertainty: 0.003234
-Median formal prism-response uncertainty: 0.001006 mag
+Ice log-throughput surface RMS error: 0.025264
+Prism spectrophotometric-response RMS error: 0.002200 mag
+Exposure ZP RMS error: 0.122879 mag
+Imaging smooth-coefficient RMS error: 0.002007 mag
+Prism smooth-coefficient RMS error: 0.003161 mag
+Amp offset RMS error, detector means removed: 0.001146 mag
+Field-star EMPCA coefficient RMS error: 0.155898
+Median formal ice-node uncertainty: 0.003221
+Median formal prism-response uncertainty: 0.001000 mag
 ```
 
 The imaging and prism residuals reach their injected noise scales, but the
