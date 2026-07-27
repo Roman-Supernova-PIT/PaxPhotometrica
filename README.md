@@ -801,6 +801,15 @@ Imaging plots show every retained stellar observation; the prism plot shows one
 source point per `spectrum_id`, rather than repeating the point for every
 wavelength pixel.
 
+The parent catalog's `n_star` sources are drawn uniformly over the **union of
+all imaging and prism exposure footprints**. They are not confined to exposure
+0's undithered `4096 x 4096` footprint. Consequently, every exposure samples
+stars over its full detector area. Because the fixed catalog is spread over a
+larger sky area, `n_star` is the total number of unique simulated sources, not
+the number falling in each exposure; the default retains roughly 850--950
+imaging measurements per exposure after detector bounds and random detection
+losses are applied.
+
 For one detector, the sky tangent plane is simply the undithered detector frame.
 For multiple detectors, `detector_layout.csv` places the simulated detectors in
 a six-column display mosaic with an 8% gap. This is only a clear visualization

@@ -295,6 +295,79 @@ def detector_outline_on_sky(
     return sky_x, sky_y
 
 
+def sample_star_sky_catalog(
+    rng: np.random.Generator,
+    dither_dx: np.ndarray,
+    dither_dy: np.ndarray,
+    rotation_deg: np.ndarray,
+    config: SimConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Draw stars uniformly over the union of all exposure footprints.
+
+    Sampling only inside the reference detector would leave dithered footprint
+    edges without input stars. Rejection sampling from the footprint bounding
+    box preserves a fixed-size catalog while ensuring every simulated star is
+    observable in at least one requested exposure.
+    """
+    dither_dx = np.asarray(dither_dx, dtype=float)
+    dither_dy = np.asarray(dither_dy, dtype=float)
+    rotation_deg = np.asarray(rotation_deg, dtype=float)
+    if not (dither_dx.size == dither_dy.size == rotation_deg.size):
+        raise ValueError("Exposure dither and rotation arrays must have equal length")
+    if dither_dx.size == 0:
+        raise ValueError("At least one exposure footprint is required")
+
+    zero_offset = np.zeros(1, dtype=float)
+    outlines = [
+        detector_outline_on_sky(
+            dx,
+            dy,
+            angle,
+            0,
+            zero_offset,
+            zero_offset,
+            config,
+        )
+        for dx, dy, angle in zip(dither_dx, dither_dy, rotation_deg)
+    ]
+    all_outline_x = np.concatenate([outline[0] for outline in outlines])
+    all_outline_y = np.concatenate([outline[1] for outline in outlines])
+    x_min, x_max = float(all_outline_x.min()), float(all_outline_x.max())
+    y_min, y_max = float(all_outline_y.min()), float(all_outline_y.max())
+
+    accepted_x: list[np.ndarray] = []
+    accepted_y: list[np.ndarray] = []
+    n_accepted = 0
+    while n_accepted < config.n_star:
+        batch_size = max(1024, 2 * (config.n_star - n_accepted))
+        candidate_x = rng.uniform(x_min, x_max, size=batch_size)
+        candidate_y = rng.uniform(y_min, y_max, size=batch_size)
+        covered = np.zeros(batch_size, dtype=bool)
+        for dx, dy, angle in zip(dither_dx, dither_dy, rotation_deg):
+            detector_x, detector_y = apply_exposure_transform(
+                candidate_x,
+                candidate_y,
+                float(dx),
+                float(dy),
+                float(angle),
+                config,
+            )
+            covered |= (
+                (detector_x >= 0.0)
+                & (detector_x < config.nx)
+                & (detector_y >= 0.0)
+                & (detector_y < config.ny)
+            )
+        accepted_x.append(candidate_x[covered])
+        accepted_y.append(candidate_y[covered])
+        n_accepted += int(np.count_nonzero(covered))
+
+    return (
+        np.concatenate(accepted_x)[: config.n_star],
+        np.concatenate(accepted_y)[: config.n_star],
+    )
+
+
 def make_wavelength_grid(config: SimConfig) -> np.ndarray:
     return np.linspace(config.wave_min, config.wave_max, config.n_wave)
 
@@ -888,6 +961,63 @@ def simulate_data(config: SimConfig) -> None:
         prism_wave, config.prism_response_sigma_mag, rng
     )
 
+    # Draw all pointing geometry before the sky catalog. The parent catalog is
+    # sampled over the union of these footprints, rather than only within the
+    # undithered reference detector.
+    exposure_filter = np.arange(config.n_exp, dtype=int) % config.n_filter
+    epoch_id = np.arange(config.n_exp, dtype=int)
+    dither_dx = rng.normal(0.0, config.dither_sigma_pix, size=config.n_exp)
+    dither_dy = rng.normal(0.0, config.dither_sigma_pix, size=config.n_exp)
+    dither_dx[0] = 0.0
+    dither_dy[0] = 0.0
+    rotation_deg = exposure_rotation_sequence(config)
+    rotation_deg[0] = 0.0
+    exposure_geometry_rows = [
+        {
+            "exposure_id": exp_id,
+            "epoch_id": epoch_id[exp_id],
+            "measurement_type": "imaging",
+            "filter_id": int(exposure_filter[exp_id]),
+            "filter_name": filter_names[exposure_filter[exp_id]],
+            "dither_dx_pix": dither_dx[exp_id],
+            "dither_dy_pix": dither_dy[exp_id],
+            "rotation_deg": rotation_deg[exp_id],
+        }
+        for exp_id in range(config.n_exp)
+    ]
+
+    prism_dither_dx = rng.normal(
+        0.0, config.dither_sigma_pix, config.n_prism_exp
+    )
+    prism_dither_dy = rng.normal(
+        0.0, config.dither_sigma_pix, config.n_prism_exp
+    )
+    prism_rotation = np.asarray([], dtype=float)
+    if config.n_prism_exp > 0:
+        prism_dither_dx[0] = 0.0
+        prism_dither_dy[0] = 0.0
+        prism_rotation = np.asarray(config.rotation_angles_deg, dtype=float)[
+            np.arange(config.n_prism_exp) % len(config.rotation_angles_deg)
+        ]
+        prism_rotation[0] = 0.0
+        exposure_geometry_rows.extend(
+            {
+                "exposure_id": config.n_exp + prism_exp_index,
+                "epoch_id": config.n_exp + prism_exp_index,
+                "measurement_type": "prism",
+                "filter_id": np.nan,
+                "filter_name": "PRISM",
+                "dither_dx_pix": prism_dither_dx[prism_exp_index],
+                "dither_dy_pix": prism_dither_dy[prism_exp_index],
+                "rotation_deg": prism_rotation[prism_exp_index],
+            }
+            for prism_exp_index in range(config.n_prism_exp)
+        )
+
+    catalog_dither_dx = np.concatenate((dither_dx, prism_dither_dx))
+    catalog_dither_dy = np.concatenate((dither_dy, prism_dither_dy))
+    catalog_rotation = np.concatenate((rotation_deg, prism_rotation))
+
     write_passband_files(
         output_dir, wave, passbands, phi_shift, phi_width, filter_names
     )
@@ -914,8 +1044,13 @@ def simulate_data(config: SimConfig) -> None:
     star_detector_index = np.arange(config.n_star, dtype=int) % config.n_det
     rng.shuffle(star_detector_index)
     star_detector_id = detector_ids[star_detector_index]
-    star_base_x = rng.uniform(0.0, config.nx, size=config.n_star)
-    star_base_y = rng.uniform(0.0, config.ny, size=config.n_star)
+    star_base_x, star_base_y = sample_star_sky_catalog(
+        rng,
+        catalog_dither_dx,
+        catalog_dither_dy,
+        catalog_rotation,
+        config,
+    )
     sky_offset_x, sky_offset_y = detector_sky_offsets(config)
     star_sky_x = star_base_x + sky_offset_x[star_detector_index]
     star_sky_y = star_base_y + sky_offset_y[star_detector_index]
@@ -924,7 +1059,20 @@ def simulate_data(config: SimConfig) -> None:
     true_model_index = rng.integers(sed_library.coefficients.shape[0], size=config.n_star)
     true_sed_coeff = sed_library.coefficients[true_model_index].copy()
     n_calibrator = min(config.n_absolute_calibrator, config.n_star)
-    calibrator_ids = np.sort(rng.choice(config.n_star, size=n_calibrator, replace=False))
+    reference_visible = np.nonzero(
+        (star_base_x >= 0.0)
+        & (star_base_x < config.nx)
+        & (star_base_y >= 0.0)
+        & (star_base_y < config.ny)
+    )[0]
+    if reference_visible.size < n_calibrator:
+        raise RuntimeError(
+            "Too few stars in the shared imaging/prism reference footprint "
+            "to select the requested spectrophotometric standards"
+        )
+    calibrator_ids = np.sort(
+        rng.choice(reference_visible, size=n_calibrator, replace=False)
+    )
     is_calibrator = np.zeros(config.n_star, dtype=bool)
     is_calibrator[calibrator_ids] = True
 
@@ -1039,27 +1187,6 @@ def simulate_data(config: SimConfig) -> None:
 
     # One exposure uses one filter. The known ice amount has an epoch component
     # plus a weak detector-position component, resembling an RCS-derived scalar.
-    exposure_filter = np.arange(config.n_exp, dtype=int) % config.n_filter
-    epoch_id = np.arange(config.n_exp, dtype=int)
-    dither_dx = rng.normal(0.0, config.dither_sigma_pix, size=config.n_exp)
-    dither_dy = rng.normal(0.0, config.dither_sigma_pix, size=config.n_exp)
-    dither_dx[0] = 0.0
-    dither_dy[0] = 0.0
-    rotation_deg = exposure_rotation_sequence(config)
-    rotation_deg[0] = 0.0
-    exposure_geometry_rows = [
-        {
-            "exposure_id": exp_id,
-            "epoch_id": epoch_id[exp_id],
-            "measurement_type": "imaging",
-            "filter_id": int(exposure_filter[exp_id]),
-            "filter_name": filter_names[exposure_filter[exp_id]],
-            "dither_dx_pix": dither_dx[exp_id],
-            "dither_dy_pix": dither_dy[exp_id],
-            "rotation_deg": rotation_deg[exp_id],
-        }
-        for exp_id in range(config.n_exp)
-    ]
     slow_phase = np.linspace(0.0, 2.0 * np.pi, config.n_exp)
     exposure_ice = 0.55 + 0.35 * np.sin(slow_phase) + rng.normal(0.0, 0.07, config.n_exp)
     exposure_ice = np.clip(exposure_ice, 0.02, 1.20)
@@ -1212,27 +1339,6 @@ def simulate_data(config: SimConfig) -> None:
     prism_obs_id = 0
     spectrum_id = 0
     if config.n_prism_exp > 0:
-        prism_dither_dx = rng.normal(0.0, config.dither_sigma_pix, config.n_prism_exp)
-        prism_dither_dy = rng.normal(0.0, config.dither_sigma_pix, config.n_prism_exp)
-        prism_dither_dx[0] = 0.0
-        prism_dither_dy[0] = 0.0
-        prism_rotation = np.asarray(config.rotation_angles_deg, dtype=float)[
-            np.arange(config.n_prism_exp) % len(config.rotation_angles_deg)
-        ]
-        prism_rotation[0] = 0.0
-        exposure_geometry_rows.extend(
-            {
-                "exposure_id": config.n_exp + prism_exp_index,
-                "epoch_id": config.n_exp + prism_exp_index,
-                "measurement_type": "prism",
-                "filter_id": np.nan,
-                "filter_name": "PRISM",
-                "dither_dx_pix": prism_dither_dx[prism_exp_index],
-                "dither_dy_pix": prism_dither_dy[prism_exp_index],
-                "rotation_deg": prism_rotation[prism_exp_index],
-            }
-            for prism_exp_index in range(config.n_prism_exp)
-        )
         prism_phase = np.linspace(0.35, 1.65 * np.pi, config.n_prism_exp)
         prism_exposure_ice = 0.55 + 0.30 * np.sin(prism_phase)
         prism_exposure_ice += rng.normal(0.0, 0.05, config.n_prism_exp)
@@ -1434,6 +1540,9 @@ def simulate_data(config: SimConfig) -> None:
     metadata["prism_wavelength_output_unit"] = "micron"
     metadata["prism_trace_orientation"] = "vertical"
     metadata["sky_coordinate_system"] = "toy_tangent_plane_detector_pixels"
+    metadata["sky_catalog_sampling"] = (
+        "uniform_over_union_of_all_imaging_and_prism_exposure_footprints"
+    )
     metadata["detector_sky_layout"] = (
         "six-column display mosaic; not the physical Roman WFI SCA layout"
     )
@@ -1442,6 +1551,10 @@ def simulate_data(config: SimConfig) -> None:
     metadata["n_prism_wavelength_pixel"] = int(prism_wave.size)
     metadata["n_prism_target_star"] = int(prism_star_ids.size)
     metadata["n_prism_obs"] = len(prism_rows)
+    metadata["n_catalog_star"] = int(config.n_star)
+    metadata["n_imaging_detected_star"] = int(
+        measurements["star_id"].nunique()
+    )
     metadata["prism_reference_exposure_id"] = (
         int(config.n_exp) if config.n_prism_exp > 0 else None
     )
