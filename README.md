@@ -408,6 +408,9 @@ the accepted damping factor (`d`) from the latest completed iteration. A
 persistent line is also printed after every iteration with the separate imaging
 and prism RMS values, damping, and number of LSMR iterations.
 
+The default fit runs 15 iterations. Use `--n-iter` to select a different
+iteration count for quick tests or convergence studies.
+
 Useful fitter options:
 
 ```bash
@@ -882,29 +885,36 @@ The verified iteration summary is:
 iteration  combined RMS  imaging RMS  prism RMS  accepted damping
 0          0.031690      0.028457     0.040387   0.0000
 1          0.029390      0.026048     0.038223   0.0625
-2          0.026542      0.023657     0.034226   0.1250
+2          0.026541      0.023655     0.034226   0.1250
 3          0.024325      0.023250     0.027507   0.2500
 4          0.020875      0.021466     0.018840   0.5000
 5          0.013065      0.012046     0.015913   0.5000
-6          0.009751      0.007356     0.015074   0.5000
+6          0.009751      0.007355     0.015074   0.5000
 7          0.008709      0.005569     0.014846   0.5000
-8          0.008422      0.005015     0.014783   0.5000
+8          0.008422      0.005014     0.014783   0.5000
+9          0.008342      0.004855     0.014763   0.5000
+10         0.008316      0.004803     0.014756   0.5000
+11         0.008304      0.004779     0.014752   0.5000
+12         0.008297      0.004765     0.014750   0.5000
+13         0.008290      0.004749     0.014748   0.5000
+14         0.008277      0.004722     0.014747   0.5000
+15         0.008261      0.004686     0.014746   0.5000
 ```
 
 Final default diagnostics:
 
 ```text
-Passband shift RMS error: 0.008799 um
-Passband width RMS error: 0.055003
-Ice log-throughput surface RMS error: 0.025264
-Prism spectrophotometric-response RMS error: 0.002200 mag
-Exposure ZP RMS error: 0.122879 mag
-Imaging smooth-coefficient RMS error: 0.002007 mag
-Prism smooth-coefficient RMS error: 0.003161 mag
-Amp offset RMS error, detector means removed: 0.001146 mag
-Field-star EMPCA coefficient RMS error: 0.155898
-Median formal ice-node uncertainty: 0.003221
-Median formal prism-response uncertainty: 0.001000 mag
+Passband shift RMS error: 0.008504 um
+Passband width RMS error: 0.049688
+Ice log-throughput surface RMS error: 0.025392
+Prism spectrophotometric-response RMS error: 0.002183 mag
+Exposure ZP RMS error: 0.121064 mag
+Imaging smooth-coefficient RMS error: 0.002046 mag
+Prism smooth-coefficient RMS error: 0.003047 mag
+Amp offset RMS error, detector means removed: 0.001177 mag
+Field-star EMPCA coefficient RMS error: 0.156358
+Median formal ice-node uncertainty: 0.003742
+Median formal prism-response uncertainty: 0.000933 mag
 ```
 
 The imaging and prism residuals reach their injected noise scales, but the

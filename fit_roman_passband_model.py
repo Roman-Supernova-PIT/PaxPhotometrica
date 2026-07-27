@@ -121,7 +121,7 @@ class FitConfig:
     input_dir: str = "passband_sim_outputs"
     output_dir: str = "passband_fit_outputs"
     sed_basis_path: str = ""
-    n_iter: int = 8
+    n_iter: int = 15
     damping: float = 0.5
     min_damping: float = 0.0078125
     max_stars: int | None = None
