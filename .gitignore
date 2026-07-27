@@ -1,0 +1,20 @@
+.DS_Store
+.mplconfig/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.coverage
+.venv/
+build/
+dist/
+
+calibration_query_passbands.csv
+calibration_query_results.csv
+outputs_amp_prototype/
+passband_fit_outputs/
+passband_sim_outputs/
+
+# Raw BOSZ source spectra are provenance inputs, not runtime package data.
+m+0.00/
+

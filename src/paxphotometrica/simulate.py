@@ -24,6 +24,7 @@ measurement made by the detector.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 import json
 import os
@@ -40,6 +41,8 @@ os.environ.setdefault("XDG_CACHE_HOME", str(_MPL_CACHE.resolve()))
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+from .resources import data_path
 
 
 SPEED_OF_LIGHT_CM_S = 2.99792458e10
@@ -63,10 +66,10 @@ class SimConfig:
     wave_min: float = 0.45
     wave_max: float = 2.30
     n_wave: int = 2000
-    passband_file: str = "passbands.txt"
-    prism_wavelength_file: str = "prism wavelengths"
-    sed_basis_path: str = "bosz_logflux_empca_basis.npz"
-    ice_loglam_nodes_file: str = "ice_loglam_nodes.txt"
+    passband_file: str = str(data_path("passbands.txt"))
+    prism_wavelength_file: str = str(data_path("prism_wavelengths.txt"))
+    sed_basis_path: str = str(data_path("bosz_logflux_empca_basis.npz"))
+    ice_loglam_nodes_file: str = str(data_path("ice_loglam_nodes.txt"))
     n_ice_thickness_nodes: int = 5
     ice_thickness_min: float = 0.0
     ice_thickness_max: float = 1.2
@@ -1662,13 +1665,22 @@ def make_diagnostic_plots(
     plt.close(fig)
 
 
-def parse_args() -> SimConfig:
-    parser = argparse.ArgumentParser(description=__doc__)
+def parse_args(
+    argv: Sequence[str] | None = None, prog: str | None = None
+) -> SimConfig:
+    parser = argparse.ArgumentParser(description=__doc__, prog=prog)
     parser.add_argument("--output-dir", default=SimConfig.output_dir)
+    parser.add_argument("--random-seed", type=int, default=SimConfig.random_seed)
+    parser.add_argument("--n-star", type=int, default=SimConfig.n_star)
+    parser.add_argument("--n-exp", type=int, default=SimConfig.n_exp)
+    parser.add_argument("--n-det", type=int, default=SimConfig.n_det)
     parser.add_argument("--passband-file", default=SimConfig.passband_file)
     parser.add_argument("--prism-wavelength-file", default=SimConfig.prism_wavelength_file)
     parser.add_argument("--n-prism-exp", type=int, default=SimConfig.n_prism_exp)
     parser.add_argument("--prism-star-fraction", type=float, default=SimConfig.prism_star_fraction)
+    parser.add_argument("--phot-sigma-mag", type=float, default=SimConfig.phot_sigma_mag)
+    parser.add_argument("--prism-sigma-mag", type=float, default=SimConfig.prism_sigma_mag)
+    parser.add_argument("--dither-sigma-pix", type=float, default=SimConfig.dither_sigma_pix)
     parser.add_argument("--sed-basis-path", default=SimConfig.sed_basis_path)
     parser.add_argument("--reference-filter-id", type=int, default=SimConfig.reference_filter_id)
     parser.add_argument(
@@ -1682,13 +1694,20 @@ def parse_args() -> SimConfig:
     parser.add_argument("--n-ice-thickness-nodes", type=int, default=SimConfig.n_ice_thickness_nodes)
     parser.add_argument("--ice-thickness-min", type=float, default=SimConfig.ice_thickness_min)
     parser.add_argument("--ice-thickness-max", type=float, default=SimConfig.ice_thickness_max)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     return SimConfig(
         output_dir=args.output_dir,
+        random_seed=args.random_seed,
+        n_star=args.n_star,
+        n_exp=args.n_exp,
+        n_det=args.n_det,
         passband_file=args.passband_file,
         prism_wavelength_file=args.prism_wavelength_file,
         n_prism_exp=args.n_prism_exp,
         prism_star_fraction=args.prism_star_fraction,
+        phot_sigma_mag=args.phot_sigma_mag,
+        prism_sigma_mag=args.prism_sigma_mag,
+        dither_sigma_pix=args.dither_sigma_pix,
         sed_basis_path=args.sed_basis_path,
         reference_filter_id=args.reference_filter_id,
         n_absolute_calibrator=args.n_absolute_calibrator,
@@ -1699,8 +1718,10 @@ def parse_args() -> SimConfig:
     )
 
 
-def main() -> None:
-    simulate_data(parse_args())
+def main(
+    argv: Sequence[str] | None = None, prog: str | None = None
+) -> None:
+    simulate_data(parse_args(argv, prog))
 
 
 if __name__ == "__main__":

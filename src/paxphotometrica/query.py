@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Query fitted Roman-like calibration products for new instrumental photometry.
 
-This utility reads the CSV products written by ``fit_roman_passband_model.py``
+This utility reads the CSV products written by ``paxphot fit``
 and evaluates, for arbitrary observations:
 
 * the scalar instrumental calibration term
@@ -20,6 +20,7 @@ the simulator. The passband is evaluated on the simulator wavelength grid.
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -474,9 +475,12 @@ def print_summary(result: pd.DataFrame, max_rows: int) -> None:
         print(f"... {len(result) - max_rows} more rows written to the output CSV")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(
+    argv: Sequence[str] | None = None, prog: str | None = None
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Query fitted Roman calibration products for AB zeropoints and passbands."
+        description="Query fitted Roman calibration products for AB zeropoints and passbands.",
+        prog=prog,
     )
     parser.add_argument("--sim-dir", default=QueryConfig.sim_dir)
     parser.add_argument("--fit-dir", default=QueryConfig.fit_dir)
@@ -509,11 +513,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional instrumental magnitude to calibrate to AB for a manual one-row query.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(
+    argv: Sequence[str] | None = None, prog: str | None = None
+) -> None:
+    args = parse_args(argv, prog)
     config = QueryConfig(
         sim_dir=args.sim_dir,
         fit_dir=args.fit_dir,

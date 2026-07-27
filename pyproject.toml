@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paxphotometrica"
+version = "0.1.0"
+description = "Sparse Roman-like imaging and prism calibration prototypes"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+  "matplotlib>=3.6",
+  "numpy>=1.23",
+  "pandas>=1.5",
+  "scipy>=1.9",
+  "tqdm>=4.64",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Astronomy",
+]
+
+[project.urls]
+Repository = "https://github.com/Roman-Supernova-PIT/PaxPhotometrica"
+Issues = "https://github.com/Roman-Supernova-PIT/PaxPhotometrica/issues"
+
+[project.scripts]
+paxphot = "paxphotometrica.cli:main"
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+release = ["build>=1", "twine>=5"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+paxphotometrica = ["data/*.md", "data/*.npz", "data/*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

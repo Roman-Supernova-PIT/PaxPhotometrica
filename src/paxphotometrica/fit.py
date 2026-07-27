@@ -22,6 +22,7 @@ Spectrophotometric standards instead enter as fixed physical
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from dataclasses import dataclass
 import json
 import os
@@ -42,6 +43,8 @@ import pandas as pd
 from scipy.sparse import coo_matrix
 from scipy.sparse.linalg import lsmr, lsqr
 from tqdm import tqdm
+
+from .resources import data_path
 
 
 MAG_FACTOR = 2.5 / np.log(10.0)
@@ -356,21 +359,21 @@ def evaluate_ice_surface_chunk(
 
 
 def resolve_sed_basis_path(config: FitConfig, sim_metadata: dict, input_dir: Path) -> Path:
-    """Find the BOSZ EMPCA basis, honoring CLI, metadata, and local defaults."""
+    """Find the BOSZ EMPCA basis, honoring CLI, metadata, and package defaults."""
     candidates = []
     if config.sed_basis_path:
         candidates.append(Path(config.sed_basis_path))
     metadata_path = sim_metadata.get("sed_basis_path")
     if metadata_path:
         candidates.extend([Path(metadata_path), input_dir / metadata_path])
-    candidates.append(Path("bosz_logflux_empca_basis.npz"))
+    candidates.append(data_path("bosz_logflux_empca_basis.npz"))
 
     for candidate in candidates:
         if candidate.exists():
             return candidate
     raise FileNotFoundError(
-        "Could not find BOSZ EMPCA basis. Pass --sed-basis-path or keep "
-        "bosz_logflux_empca_basis.npz in the working directory."
+        "Could not find the BOSZ EMPCA basis. Pass --sed-basis-path or "
+        "reinstall PaxPhotometrica with its bundled reference data."
     )
 
 
@@ -3046,15 +3049,17 @@ def make_plots(
     plt.close()
 
 
-def parse_args() -> FitConfig:
-    parser = argparse.ArgumentParser(description=__doc__)
+def parse_args(
+    argv: Sequence[str] | None = None, prog: str | None = None
+) -> FitConfig:
+    parser = argparse.ArgumentParser(description=__doc__, prog=prog)
     parser.add_argument("--input-dir", default=FitConfig.input_dir)
     parser.add_argument("--output-dir", default=FitConfig.output_dir)
     parser.add_argument("--sed-basis-path", default=FitConfig.sed_basis_path)
     parser.add_argument("--n-iter", type=int, default=FitConfig.n_iter)
     parser.add_argument("--damping", type=float, default=FitConfig.damping)
     parser.add_argument("--max-stars", type=int, default=None)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     return FitConfig(
         input_dir=args.input_dir,
         output_dir=args.output_dir,
@@ -3065,9 +3070,11 @@ def parse_args() -> FitConfig:
     )
 
 
-def main() -> None:
+def main(
+    argv: Sequence[str] | None = None, prog: str | None = None
+) -> None:
     warnings.filterwarnings("ignore", category=RuntimeWarning)
-    config = parse_args()
+    config = parse_args(argv, prog)
     data = load_data(config)
     state, summary, final_resid, final_prism_resid = run_fit(data, config)
     param_sigma, slices, uncertainty_info = estimate_parameter_uncertainties(data, state, config)
