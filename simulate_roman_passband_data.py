@@ -253,6 +253,48 @@ def apply_exposure_transform(
     return x, y
 
 
+def detector_sky_offsets(config: SimConfig) -> tuple[np.ndarray, np.ndarray]:
+    """Return a simple display-mosaic offset for each simulated detector.
+
+    The simulator does not yet model the physical Roman focal-plane mosaic.
+    For sky-coverage diagnostics, detectors are therefore placed on a toy
+    tangent plane in a six-column grid with a small gap. Detector-local source
+    coordinates and all calibration calculations remain unchanged.
+    """
+    n_column = min(6, max(1, config.n_det))
+    detector_index = np.arange(config.n_det, dtype=int)
+    gap = 0.08 * max(config.nx, config.ny)
+    offset_x = (detector_index % n_column) * (config.nx + gap)
+    offset_y = (detector_index // n_column) * (config.ny + gap)
+    return offset_x, offset_y
+
+
+def detector_outline_on_sky(
+    dx: float,
+    dy: float,
+    rotation_deg: float,
+    detector_index: int,
+    sky_offset_x: np.ndarray,
+    sky_offset_y: np.ndarray,
+    config: SimConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map detector corners back to the fixed toy sky tangent plane."""
+    cx = 0.5 * (config.nx - 1.0)
+    cy = 0.5 * (config.ny - 1.0)
+    detector_x = np.asarray([0.0, config.nx, config.nx, 0.0, 0.0])
+    detector_y = np.asarray([0.0, 0.0, config.ny, config.ny, 0.0])
+    shifted_x = detector_x - cx - dx
+    shifted_y = detector_y - cy - dy
+    theta = np.deg2rad(rotation_deg)
+    cos_t = np.cos(theta)
+    sin_t = np.sin(theta)
+    sky_x = cx + cos_t * shifted_x + sin_t * shifted_y
+    sky_y = cy - sin_t * shifted_x + cos_t * shifted_y
+    sky_x += sky_offset_x[detector_index]
+    sky_y += sky_offset_y[detector_index]
+    return sky_x, sky_y
+
+
 def make_wavelength_grid(config: SimConfig) -> np.ndarray:
     return np.linspace(config.wave_min, config.wave_max, config.n_wave)
 
@@ -709,6 +751,114 @@ def make_standard_spectra_plot(
     plt.close()
 
 
+def make_sky_coverage_plots(
+    output_dir: Path,
+    measurements: pd.DataFrame,
+    prism_measurements: pd.DataFrame,
+    exposure_geometry: pd.DataFrame,
+    filter_names: list[str],
+    config: SimConfig,
+) -> None:
+    """Plot observed sky positions and detector outlines for every exposure."""
+    sky_offset_x, sky_offset_y = detector_sky_offsets(config)
+
+    def plot_one(
+        observed: pd.DataFrame,
+        geometry: pd.DataFrame,
+        label: str,
+        output_name: str,
+        prism: bool = False,
+    ) -> None:
+        if observed.empty or geometry.empty:
+            (output_dir / output_name).unlink(missing_ok=True)
+            return
+
+        exposure_ids = np.sort(geometry["exposure_id"].to_numpy(int))
+        colors = plt.get_cmap("tab10")(
+            np.linspace(0.0, 1.0, max(2, exposure_ids.size))
+        )
+        fig, ax = plt.subplots(figsize=(9.5, 7.2))
+        for color_index, exposure_id in enumerate(exposure_ids):
+            color = colors[color_index]
+            exposure_rows = observed.loc[observed["exposure_id"] == exposure_id]
+            if prism:
+                # One point per extracted spectrum represents the source
+                # position; plotting every wavelength pixel would overplot it.
+                exposure_rows = exposure_rows.drop_duplicates("spectrum_id")
+            ax.scatter(
+                exposure_rows["sky_x"],
+                exposure_rows["sky_y"],
+                s=13 if prism else 4,
+                color=color,
+                alpha=0.72 if prism else 0.22,
+                edgecolors="none",
+                rasterized=True,
+                zorder=2,
+            )
+
+            geometry_row = geometry.loc[
+                geometry["exposure_id"] == exposure_id
+            ].iloc[0]
+            for detector_index in range(config.n_det):
+                outline_x, outline_y = detector_outline_on_sky(
+                    float(geometry_row["dither_dx_pix"]),
+                    float(geometry_row["dither_dy_pix"]),
+                    float(geometry_row["rotation_deg"]),
+                    detector_index,
+                    sky_offset_x,
+                    sky_offset_y,
+                    config,
+                )
+                ax.plot(
+                    outline_x,
+                    outline_y,
+                    color=color,
+                    linewidth=1.4,
+                    alpha=0.9,
+                    label=f"Exposure {exposure_id}"
+                    if detector_index == 0
+                    else None,
+                    zorder=3,
+                )
+
+        ax.set_xlabel("Sky tangent-plane x [detector pixels]")
+        ax.set_ylabel("Sky tangent-plane y [detector pixels]")
+        ax.set_title(f"{label} input sky coverage")
+        ax.set_aspect("equal", adjustable="datalim")
+        ax.grid(color="0.88", linewidth=0.6)
+        ax.legend(
+            title="Detector outlines",
+            loc="upper left",
+            bbox_to_anchor=(1.01, 1.0),
+            borderaxespad=0.0,
+            fontsize=8,
+        )
+        fig.tight_layout()
+        fig.savefig(output_dir / output_name, dpi=160, bbox_inches="tight")
+        plt.close(fig)
+
+    imaging_geometry = exposure_geometry.loc[
+        exposure_geometry["measurement_type"] == "imaging"
+    ]
+    for filter_id, filter_name in enumerate(filter_names):
+        plot_one(
+            measurements.loc[measurements["filter_id"] == filter_id],
+            imaging_geometry.loc[imaging_geometry["filter_id"] == filter_id],
+            filter_name,
+            f"sky_coverage_{filter_name}.png",
+        )
+
+    plot_one(
+        prism_measurements,
+        exposure_geometry.loc[
+            exposure_geometry["measurement_type"] == "prism"
+        ],
+        "PRISM",
+        "sky_coverage_PRISM.png",
+        prism=True,
+    )
+
+
 def simulate_data(config: SimConfig) -> None:
     rng = np.random.default_rng(config.random_seed)
     output_dir = Path(config.output_dir)
@@ -766,6 +916,9 @@ def simulate_data(config: SimConfig) -> None:
     star_detector_id = detector_ids[star_detector_index]
     star_base_x = rng.uniform(0.0, config.nx, size=config.n_star)
     star_base_y = rng.uniform(0.0, config.ny, size=config.n_star)
+    sky_offset_x, sky_offset_y = detector_sky_offsets(config)
+    star_sky_x = star_base_x + sky_offset_x[star_detector_index]
+    star_sky_y = star_base_y + sky_offset_y[star_detector_index]
 
     true_mag_norm = rng.uniform(18.0, 22.0, size=config.n_star)
     true_model_index = rng.integers(sed_library.coefficients.shape[0], size=config.n_star)
@@ -785,6 +938,8 @@ def simulate_data(config: SimConfig) -> None:
         "detector_id": star_detector_id,
         "x": star_base_x,
         "y": star_base_y,
+        "sky_x": star_sky_x,
+        "sky_y": star_sky_y,
         "mag_norm": true_mag_norm,
         "is_absolute_calibrator": is_calibrator,
         "is_spectrophotometric_standard": is_calibrator,
@@ -892,6 +1047,19 @@ def simulate_data(config: SimConfig) -> None:
     dither_dy[0] = 0.0
     rotation_deg = exposure_rotation_sequence(config)
     rotation_deg[0] = 0.0
+    exposure_geometry_rows = [
+        {
+            "exposure_id": exp_id,
+            "epoch_id": epoch_id[exp_id],
+            "measurement_type": "imaging",
+            "filter_id": int(exposure_filter[exp_id]),
+            "filter_name": filter_names[exposure_filter[exp_id]],
+            "dither_dx_pix": dither_dx[exp_id],
+            "dither_dy_pix": dither_dy[exp_id],
+            "rotation_deg": rotation_deg[exp_id],
+        }
+        for exp_id in range(config.n_exp)
+    ]
     slow_phase = np.linspace(0.0, 2.0 * np.pi, config.n_exp)
     exposure_ice = 0.55 + 0.35 * np.sin(slow_phase) + rng.normal(0.0, 0.07, config.n_exp)
     exposure_ice = np.clip(exposure_ice, 0.02, 1.20)
@@ -989,6 +1157,8 @@ def simulate_data(config: SimConfig) -> None:
                     "amp_id": amp_id,
                     "x": x,
                     "y": y,
+                    "sky_x": star_sky_x[star_id],
+                    "sky_y": star_sky_y[star_id],
                     "ice_thickness": ice_thickness,
                     "ice_amount_obs": ice_thickness,
                     "mag_obs": mag_obs,
@@ -1010,7 +1180,8 @@ def simulate_data(config: SimConfig) -> None:
             )
             obs_id += 1
 
-    pd.DataFrame(rows).to_csv(output_dir / "measurements.csv", index=False)
+    measurements = pd.DataFrame(rows)
+    measurements.to_csv(output_dir / "measurements.csv", index=False)
 
     # Prism traces are vertical. Every wavelength pixel in one spectrum has the
     # same detector x coordinate and therefore the same amplifier ID; wavelength
@@ -1049,6 +1220,19 @@ def simulate_data(config: SimConfig) -> None:
             np.arange(config.n_prism_exp) % len(config.rotation_angles_deg)
         ]
         prism_rotation[0] = 0.0
+        exposure_geometry_rows.extend(
+            {
+                "exposure_id": config.n_exp + prism_exp_index,
+                "epoch_id": config.n_exp + prism_exp_index,
+                "measurement_type": "prism",
+                "filter_id": np.nan,
+                "filter_name": "PRISM",
+                "dither_dx_pix": prism_dither_dx[prism_exp_index],
+                "dither_dy_pix": prism_dither_dy[prism_exp_index],
+                "rotation_deg": prism_rotation[prism_exp_index],
+            }
+            for prism_exp_index in range(config.n_prism_exp)
+        )
         prism_phase = np.linspace(0.35, 1.65 * np.pi, config.n_prism_exp)
         prism_exposure_ice = 0.55 + 0.30 * np.sin(prism_phase)
         prism_exposure_ice += rng.normal(0.0, 0.05, config.n_prism_exp)
@@ -1155,6 +1339,8 @@ def simulate_data(config: SimConfig) -> None:
                             "bin_width_um": prism_bin_width[prism_pixel_id],
                             "x": x,
                             "y": y_valid[local],
+                            "sky_x": star_sky_x[star_id],
+                            "sky_y": star_sky_y[star_id],
                             "ice_thickness": ice_thickness[local],
                             "mag_obs": mag_obs[local],
                             "mag_unc": config.prism_sigma_mag,
@@ -1185,6 +1371,8 @@ def simulate_data(config: SimConfig) -> None:
         "bin_width_um",
         "x",
         "y",
+        "sky_x",
+        "sky_y",
         "ice_thickness",
         "mag_obs",
         "mag_unc",
@@ -1198,10 +1386,19 @@ def simulate_data(config: SimConfig) -> None:
         "true_scalar_delta_mag",
         "is_spectrophotometric_standard",
     ]
-    pd.DataFrame(prism_rows, columns=prism_columns).to_csv(
-        output_dir / "prism_measurements.csv",
-        index=False,
-    )
+    prism_measurements = pd.DataFrame(prism_rows, columns=prism_columns)
+    prism_measurements.to_csv(output_dir / "prism_measurements.csv", index=False)
+    exposure_geometry = pd.DataFrame(exposure_geometry_rows)
+    exposure_geometry.to_csv(output_dir / "exposure_geometry.csv", index=False)
+    pd.DataFrame(
+        {
+            "detector_id": detector_ids,
+            "sky_offset_x_pix": sky_offset_x,
+            "sky_offset_y_pix": sky_offset_y,
+            "nx": config.nx,
+            "ny": config.ny,
+        }
+    ).to_csv(output_dir / "detector_layout.csv", index=False)
 
     metadata = asdict(config)
     metadata["wave_min"] = float(wave.min())
@@ -1236,6 +1433,12 @@ def simulate_data(config: SimConfig) -> None:
     metadata["prism_wavelength_input_unit"] = "Angstrom"
     metadata["prism_wavelength_output_unit"] = "micron"
     metadata["prism_trace_orientation"] = "vertical"
+    metadata["sky_coordinate_system"] = "toy_tangent_plane_detector_pixels"
+    metadata["detector_sky_layout"] = (
+        "six-column display mosaic; not the physical Roman WFI SCA layout"
+    )
+    metadata["exposure_geometry_file"] = "exposure_geometry.csv"
+    metadata["detector_layout_file"] = "detector_layout.csv"
     metadata["n_prism_wavelength_pixel"] = int(prism_wave.size)
     metadata["n_prism_target_star"] = int(prism_star_ids.size)
     metadata["n_prism_obs"] = len(prism_rows)
@@ -1245,6 +1448,14 @@ def simulate_data(config: SimConfig) -> None:
     with open(output_dir / "simulation_metadata.json", "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2, sort_keys=True)
 
+    make_sky_coverage_plots(
+        output_dir,
+        measurements,
+        prism_measurements,
+        exposure_geometry,
+        filter_names,
+        config,
+    )
     make_diagnostic_plots(
         output_dir,
         wave,

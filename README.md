@@ -317,6 +317,11 @@ Notation:
 - `passband_sim_outputs/prism_measurements.csv`: one row per extracted prism
   wavelength pixel. Only a configurable fraction of stars receive prism
   spectra, but all fixed spectrophotometric standards are included.
+- `passband_sim_outputs/exposure_geometry.csv`: imaging and prism exposure
+  dithers, rotations, measurement types, and imaging-filter assignments used
+  to reconstruct detector footprints on the toy sky tangent plane.
+- `passband_sim_outputs/detector_layout.csv`: detector dimensions and display
+  offsets for the toy multi-detector sky mosaic.
 - `passband_sim_outputs/nominal_prism.csv`: prism wavelength-pixel centers,
   finite bin edges/widths, and nominal toy throughput. This table is the fixed
   wavelength solution used by the fit.
@@ -394,6 +399,10 @@ Notation:
   at representative wavelengths.
 - `passband_sim_outputs/sim_standard_spectra.png`: physical `f_lambda` inputs
   for the simulated spectrophotometric standards.
+- `passband_sim_outputs/sky_coverage_F062.png` through
+  `sky_coverage_F184.png`, plus `sky_coverage_PRISM.png`: observed source
+  positions and detector outlines on the toy sky tangent plane, colored and
+  labeled by exposure.
 
 ### Run
 
@@ -665,6 +674,8 @@ detector_id
 amp_id
 x
 y
+sky_x
+sky_y
 ice_thickness
 ice_amount_obs
 mag_obs
@@ -703,6 +714,9 @@ Column meanings:
 - `amp_id`: zero-based amplifier stripe ID, computed as
   `floor(x / (nx / n_amp))` and clipped to the available amplifier range.
 - `x`, `y`: detector pixel coordinates for this observation.
+- `sky_x`, `sky_y`: fixed source position on the simulator's toy sky tangent
+  plane, measured in detector-pixel units. Dithers and rotations change `x`
+  and `y` between exposures but do not change these sky coordinates.
 - `ice_thickness`: known ice-thickness coordinate for this observation,
   including exposure/epoch variation and a small position dependence.
 - `ice_amount_obs`: backwards-compatible alias of `ice_thickness`.
@@ -743,6 +757,8 @@ wavelength_um
 bin_width_um
 x
 y
+sky_x
+sky_y
 ice_thickness
 mag_obs
 mag_unc
@@ -762,9 +778,34 @@ is_spectrophotometric_standard
 `wavelength_pixel_id` selects a row of `nominal_prism.csv` and a fitted `P_p`
 term. The prism spectra are vertical: x and `amp_id` are constant within each
 `spectrum_id`, while y changes by one detector pixel per wavelength sample.
+The source `sky_x` and `sky_y` are consequently constant across the spectrum.
 Thus a single spectrum never crosses an amplifier boundary. A dither may move
 the whole trace onto a different amplifier in another exposure, which supplies
 relative constraints on the same amplifier gains used by all six filters.
+
+### Sky Coverage Geometry
+
+The sky-coverage diagnostics invert the same exposure transform used to create
+the measurements. In detector-local coordinates,
+
+```text
+[x - center] = Rotation(rotation_deg) [sky - center] + [dither_dx_pix]
+[y - center]                                             [dither_dy_pix]
+```
+
+`exposure_geometry.csv` stores one row per exposure with `exposure_id`,
+`epoch_id`, `measurement_type`, `filter_id`, `filter_name`,
+`dither_dx_pix`, `dither_dy_pix`, and `rotation_deg`. The detector corners are
+mapped back through the inverse transform to draw each exposure outline.
+Imaging plots show every retained stellar observation; the prism plot shows one
+source point per `spectrum_id`, rather than repeating the point for every
+wavelength pixel.
+
+For one detector, the sky tangent plane is simply the undithered detector frame.
+For multiple detectors, `detector_layout.csv` places the simulated detectors in
+a six-column display mosaic with an 8% gap. This is only a clear visualization
+coordinate system: it is not the physical Roman WFI SCA layout and does not
+alter detector-local calibration calculations.
 
 All five default standards receive prism spectra. Their physical `f_lambda`
 files are used directly, so they determine the absolute wavelength-dependent
